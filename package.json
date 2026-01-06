@@ -1,0 +1,28 @@
+{
+  "name": "interview-markdown",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yeliping/interview-markdown.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/yeliping/interview-markdown/issues"
+  },
+  "homepage": "https://github.com/yeliping/interview-markdown#readme",
+  "devDependencies": {
+    "gh-pages": "^6.3.0",
+    "vitepress": "^1.6.4"
+  }
+}
