@@ -1,0 +1,58 @@
+/* 自定义样式 */
+
+/* 侧边栏基础样式 */
+.VPSidebar {
+  width: 280px !important;
+  min-width: 200px !important;
+  max-width: 500px !important;
+  transition: width 0.1s ease;
+}
+
+/* 调整手柄 */
+.resize-handle {
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: 5px;
+  height: 100%;
+  background: transparent;
+  cursor: col-resize;
+  z-index: 100;
+  transition: background 0.2s;
+}
+
+.resize-handle:hover,
+.resize-handle.active {
+  background: var(--vp-c-brand);
+}
+
+/* 内容区域 */
+.VPContent {
+  padding-left: 280px !important;
+  transition: padding-left 0.1s ease;
+}
+
+/* 响应式 */
+@media (max-width: 960px) {
+  .VPSidebar {
+    width: 100% !important;
+  }
+
+  .VPContent {
+    padding-left: 0 !important;
+  }
+
+  .resize-handle {
+    display: none;
+  }
+}
+
+@media (min-width: 961px) and (max-width: 1280px) {
+  .VPSidebar {
+    width: 260px !important;
+  }
+
+  .VPContent {
+    padding-left: 260px !important;
+  }
+}

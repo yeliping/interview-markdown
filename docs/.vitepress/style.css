@@ -1,0 +1,56 @@
+/* 自定义样式 - 可调整侧边栏宽度 */
+
+/* 增加侧边栏默认宽度 */
+.VPSidebar {
+  width: 280px !important;
+}
+
+/* 侧边栏内容区域 */
+.VPSidebar .curtain {
+  width: 100% !important;
+}
+
+/* 侧边栏链接文本不换行，确保完整显示 */
+.VPSidebar a {
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+}
+
+/* 鼠标悬停时显示完整文本 */
+.VPSidebar a:hover {
+  overflow: visible !important;
+  white-space: normal !important;
+}
+
+/* 侧边栏分组标题 */
+.VPSidebar .group-title {
+  white-space: nowrap !important;
+}
+
+/* 调整内容区域宽度以适应更宽的侧边栏 */
+.VPContent {
+  padding-left: 280px !important;
+}
+
+/* 响应式调整 - 小屏幕 */
+@media (max-width: 960px) {
+  .VPSidebar {
+    width: 100% !important;
+  }
+
+  .VPContent {
+    padding-left: 0 !important;
+  }
+}
+
+/* 中等屏幕 */
+@media (min-width: 961px) and (max-width: 1280px) {
+  .VPSidebar {
+    width: 260px !important;
+  }
+
+  .VPContent {
+    padding-left: 260px !important;
+  }
+}
