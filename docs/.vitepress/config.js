@@ -1,13 +1,9 @@
 import { defineConfig } from 'vitepress'
-import './style.css'
 
 export default defineConfig({
   base: '/interview-markdown/',
   title: '我的文档网站',
   description: '前端知识点总结',
-  theme: {
-    extend: './theme/index.js',
-  },
 
   // 头部标签（可选）
   head: [['link', { rel: 'icon', type: 'image/svg+xml', href: '/logo.svg' }]],
