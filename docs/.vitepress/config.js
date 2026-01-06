@@ -15,7 +15,7 @@ export default defineConfig({
 
     // 导航栏
     nav: [
-      //   { text: '首页', link: '/' },
+      { text: '首页', link: '/' },
       { text: '面试题', link: '/guide/answers-vue' },
       //   { text: '示例', link: '/examples/demo' },
       //   {
@@ -29,7 +29,7 @@ export default defineConfig({
 
     // 侧边栏
     sidebar: {
-      '/guide/': [
+      '/': [
         {
           text: '前端面试知识点',
           collapsible: true,
