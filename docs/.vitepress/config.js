@@ -1,6 +1,7 @@
 import { defineConfig } from 'vitepress'
 
 export default defineConfig({
+  base: '/interview-markdown/',
   title: '我的文档网站',
   description: '前端知识点总结',
 
