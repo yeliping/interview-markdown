@@ -1,0 +1,1 @@
+import{_ as e,c as r,o as t,ag as i}from"./chunks/framework.BcGJFdya.js";const g=JSON.parse('{"title":"前端面试知识点总结","description":"","frontmatter":{},"headers":[],"relativePath":"index.md","filePath":"index.md"}'),l={name:"index.md"};function n(o,a,s,h,d,u){return t(),r("div",null,[...a[0]||(a[0]=[i("",19)])])}const m=e(l,[["render",n]]);export{g as __pageData,m as default};
