@@ -60,7 +60,10 @@ export default defineConfig({
 
     // 社交图标（可选）
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/yourname/my-docs' },
+      {
+        icon: 'github',
+        link: 'https://github.com/yeliping/interview-markdown',
+      },
     ],
   },
 })
