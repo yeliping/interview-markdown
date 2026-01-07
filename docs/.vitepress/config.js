@@ -29,7 +29,8 @@ export default defineConfig({
 
     // 侧边栏
     sidebar: {
-      '/': [{
+      '/': [
+        {
           text: '前端面试知识点',
           collapsible: true,
           items: [
@@ -42,9 +43,9 @@ export default defineConfig({
             { text: 'V8 引擎', link: '/guide/answers-v8' },
             { text: 'Web3', link: '/guide/answers-web3' },
           ],
-        }
-    }
-           ],
+        },
+      ],
+    },
 
     // 页脚（可选）
     footer: {
