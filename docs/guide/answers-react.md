@@ -5979,70 +5979,1310 @@ function ComponentB() {
 
 ---
 
-## 19、React SSR（服务端渲染）的原理是什么？Next.js做了什么？
+## 19、Lane是什么？解决了React什么问题。原理是什么？
 
-### SSR 基本原理
+### Lane 是什么
 
-**什么是 SSR？**
-
-SSR（Server-Side Rendering）是指在服务器端将 React 组件渲染成 HTML 字符串，然后发送给客户端。客户端接收到的已经是完整的 HTML，可以直接显示。
-
-**SSR vs CSR 对比：**
+**Lane（车道/通道）** 是 React 18 引入的一种优先级模型，用于管理和调度任务的执行优先级。Lane 使用二进制位（bit）来表示不同的优先级级别。
 
 ```javascript
-// CSR (Client-Side Rendering)
-// 1. 服务器返回空 HTML
-<!DOCTYPE html>
-<html>
-  <head>
-    <script src="/bundle.js"></script>
-  </head>
-  <body>
-    <div id="root"></div>
-  </body>
-</html>
+// Lane 的定义（简化版）
+const NoLanes = 0b0000000000000000000000000000000;
+const NoLane = 0b0000000000000000000000000000000;
 
-// 2. 客户端下载并执行 JS
-// 3. React 渲染组件到 DOM
-// 4. 用户看到内容
+// 同步优先级（最高）
+const SyncLane = 0b0000000000000000000000000000001;
 
-// SSR (Server-Side Rendering)
-// 1. 服务器渲染组件为 HTML
-<!DOCTYPE html>
-<html>
-  <head>
-    <title>My App</title>
-  </head>
-  <body>
-    <div id="root">
-      <h1>Hello World</h1>
-      <p>This content is rendered on server</p>
-    </div>
-    <script src="/bundle.js"></script>
-  </body>
-</html>
+// 连续输入事件优先级
+const InputContinuousLane = 0b0000000000000000000000000000100;
 
-// 2. 客户端立即显示内容
-// 3. JS 加载后进行 hydration
+// 默认优先级
+const DefaultLane = 0b0000000000000000000000000010000;
+
+// 过渡动画优先级
+const TransitionLane1 = 0b0000000000000000000000001000000;
+const TransitionLane2 = 0b0000000000000000000000010000000;
+
+// 空闲优先级
+const IdleLane = 0b0100000000000000000000000000000;
+
+// 优先级最高位
+const TotalLanes = 0b1111111111111111111111111111111;
 ```
 
-### React SSR 实现
+### Lane 解决了什么问题
 
-**1. 服务端渲染**
+Lane 主要解决了 React 18 之前优先级系统的几个核心问题：
+
+#### 1. 优先级冲突问题
+
+**之前的问题（Expiration Time 模式）：**
+```javascript
+// React 16/17 使用 Expiration Time（过期时间）
+// 问题：不同类型的更新无法区分优先级
+
+// 场景：用户输入和数据获取同时发生
+// 1. 用户输入（高优先级）
+setCount(count + 1);  // 应该立即执行
+
+// 2. 数据获取（低优先级）
+fetchData().then(data => setData(data));  // 可以延迟执行
+
+// 问题：两个更新无法区分，可能同时执行或都被阻塞
+```
+
+**Lane 的解决方案：**
+```javascript
+// Lane 使用二进制位表示优先级
+// 高优先级更新使用高位 Lane
+// 低优先级更新使用低位 Lane
+
+// 用户输入（高优先级）
+function handleClick() {
+  // 使用 InputContinuousLane
+  unstable_runWithPriority(
+    UserBlockingPriority,
+    () => {
+      setCount(count + 1);
+    }
+  );
+}
+
+// 数据获取（低优先级）
+function fetchData() {
+  // 使用 TransitionLane
+  startTransition(() => {
+    const data = await fetch('/api/data');
+    setData(data);
+  });
+}
+
+// 结果：高优先级更新会优先执行，低优先级更新会被推迟
+```
+
+#### 2. 优先级中断和恢复问题
+
+**之前的问题：**
+```javascript
+// 低优先级任务被高优先级任务中断后
+// 之前的工作可能被丢弃，需要重新开始
+
+function render() {
+  // 开始渲染低优先级任务
+  workInProgress = renderComponent(lowPriorityUpdate);
+  
+  // 高优先级任务到来
+  highPriorityUpdate();
+  
+  // 问题：之前的工作被丢弃，需要重新渲染整个组件树
+  // 浪费了之前的工作
+}
+```
+
+**Lane 的解决方案：**
+```javascript
+// Lane 支持部分完成和恢复
+// 通过位运算可以合并和拆分 lanes
+
+// 工作中的 lanes
+let workInProgressRootRenderLanes = NoLanes;
+
+// 合并 lanes
+function mergeLanes(a, b) {
+  return a | b;  // 按位或
+}
+
+// 移除 lanes
+function removeLanes(set, subset) {
+  return set & ~subset;  // 按位与非
+}
+
+// 检查是否包含某个 lane
+function isSubsetOfLanes(set, subset) {
+  return (set & subset) === subset;  // 按位与等于子集
+}
+
+// 示例：处理中断
+const workLanes = SyncLane | TransitionLane1;  // 0b0000000000000000000000000001001
+
+// 高优先级任务到来，只重新执行高优先级部分
+const highPriorityLanes = SyncLane;
+const lowPriorityLanes = TransitionLane1;
+
+// 可以保留低优先级的工作，只重新执行高优先级部分
+```
+
+#### 3. 过渡中断问题
+
+**之前的问题：**
+```javascript
+// 过渡动画被用户输入中断后
+// 整个过渡会被取消，需要重新开始
+
+// 用户滑动列表
+function onScroll() {
+  // 触发列表更新（过渡动画）
+  startTransition(() => {
+    setVisibleItems(items.slice(0, 100));
+  });
+  
+  // 用户继续滚动
+  // 问题：之前的过渡动画被完全取消
+  // 用户体验不好
+}
+```
+
+**Lane 的解决方案：**
+```javascript
+// Lane 支持过渡的优雅降级
+// 可以暂停过渡，优先响应用户输入
+
+// 过渡使用 TransitionLane
+function onScroll() {
+  // 使用 startTransition 标记过渡更新
+  startTransition(() => {
+    setVisibleItems(items.slice(0, 100));
+  });
+}
+
+// 用户输入到来
+function onUserInput() {
+  // 用户输入使用高优先级 Lane
+  setCount(count + 1);
+  
+  // 过渡更新被暂停，但不被取消
+  // 用户输入完成后，过渡可以继续
+}
+
+// 可以根据优先级决定是否中断
+function shouldYield() {
+  // 如果有更高优先级的更新，让出执行权
+  const hasHigherPriorityWork = (workInProgressRootRenderLanes & ~renderLanes) !== NoLanes;
+  
+  if (hasHigherPriorityWork) {
+    return true;  // 让出执行权
+  }
+  
+  return false;
+}
+```
+
+### Lane 的原理
+
+#### 1. 二进制位表示
+
+Lane 使用 32 位整数（或 64 位）的每一位表示一个独立的优先级通道：
 
 ```javascript
+// 32 位 Lane 模型
+// 位置越靠左，优先级越高
+
+const SyncLane =                    0b0000000000000000000000000000001;  // 第 0 位
+const InputContinuousHydrationLane = 0b0000000000000000000000000000010;  // 第 1 位
+const InputContinuousLane =          0b0000000000000000000000000000100;  // 第 2 位
+const DefaultHydrationLane =         0b0000000000000000000000000001000;  // 第 3 位
+const DefaultLane =                  0b0000000000000000000000000010000;  // 第 4 位
+const TransitionHydrationLane =      0b0000000000000000000000000100000;  // 第 5 位
+const TransitionLane1 =              0b0000000000000000000000001000000;  // 第 6 位
+const TransitionLane2 =              0b0000000000000000000000010000000;  // 第 7 位
+// ... 更多 lanes
+```
+
+#### 2. Lane 的位运算操作
+
+```javascript
+// 1. 合并 lanes
+function getHighestPriorityLanes(lanes) {
+  // 返回最高优先级的 lane
+  return lanes & -lanes;  // 获取最低位的 1（最高优先级）
+}
+
+// 示例
+const lanes = SyncLane | InputContinuousLane | TransitionLane1;
+// lanes = 0b0000000000000000000000000000101
+
+const highest = getHighestPriorityLanes(lanes);
+// highest = 0b0000000000000000000000000000001 (SyncLane)
+
+// 2. 检查是否有某个 lane
+function includesLane(set, lane) {
+  return (set & lane) === lane;
+}
+
+// 3. 移除 lanes
+function removeLanes(set, subset) {
+  return set & ~subset;
+}
+
+// 示例
+const lanes = SyncLane | TransitionLane1;
+const result = removeLanes(lanes, SyncLane);
+// result = TransitionLane1
+
+// 4. 合并 lanes
+function mergeLanes(a, b) {
+  return a | b;
+}
+
+// 5. 检查是否为空
+function isNoLanes(lanes) {
+  return lanes === NoLanes;
+}
+```
+
+#### 3. Lane 在 Fiber 节点中的使用
+
+```javascript
+// FiberNode 中的 lanes
+class FiberNode {
+  constructor(tag, pendingProps, key, lanes) {
+    // 当前节点的 lanes
+    this.lanes = lanes;
+    
+    // 子树的 lanes
+    this.childLanes = NoLanes;
+    
+    // 双缓冲
+    this.alternate = null;
+  }
+  
+  // 合并子树 lanes
+  function mergeChildLanes(fiber) {
+    let child = fiber.child;
+    let lanes = NoLanes;
+    
+    while (child !== null) {
+      lanes = mergeLanes(lanes, child.lanes);
+      lanes = mergeLanes(lanes, child.childLanes);
+      child = child.sibling;
+    }
+    
+    fiber.childLanes = lanes;
+  }
+}
+
+// 更新 lanes
+function markRootUpdated(root, updateLane) {
+  root.pendingLanes |= updateLane;
+  root.finishedLanes = NoLanes;
+}
+
+function markRootFinished(root, remainingLanes) {
+  root.finishedLanes = remainingLanes;
+}
+```
+
+#### 4. Lane 的调度流程
+
+```javascript
+// 1. 创建更新时分配 Lane
+function createUpdate(lane) {
+  const update = {
+    lane: lane,
+    payload: null,
+    next: null,
+  };
+  return update;
+}
+
+// 2. 根据优先级选择 Lane
+function requestEventTime() {
+  // 获取当前时间
+  return performance.now();
+}
+
+function requestUpdateLane(fiber) {
+  // 同步模式：使用 SyncLane
+  const mode = fiber.mode;
+  if ((mode & ConcurrentMode) === NoMode) {
+    return SyncLane;
+  }
+  
+  // 获取当前优先级
+  const currentEventTime = requestEventTime();
+  const currentUpdatePriority = getCurrentUpdatePriority();
+  
+  if (currentUpdatePriority !== NoLanes) {
+    return currentUpdatePriority;
+  }
+  
+  // 默认：使用 DefaultLane
+  return DefaultLane;
+}
+
+// 3. 调度更新
+function scheduleUpdateOnFiber(root, fiber, lane, eventTime) {
+  // 标记 root 需要更新
+  markRootUpdated(root, lane);
+  
+  // 确保 root 被调度
+  ensureRootIsScheduled(root, eventTime);
+}
+
+function ensureRootIsScheduled(root, currentTime) {
+  // 获取下一个 lanes
+  const nextLanes = getNextLanes(root);
+  
+  if (nextLanes === NoLanes) {
+    return;  // 没有需要执行的 lanes
+  }
+  
+  // 调度任务
+  scheduleCallback(
+    getPriorityForLane(nextLanes),
+    () => performConcurrentWorkOnRoot(root),
+  );
+}
+
+// 4. 执行工作
+function performConcurrentWorkOnRoot(root) {
+  // 获取要执行的 lanes
+  const lanes = getNextLanes(root);
+  
+  // 渲染 root
+  const exitStatus = renderRootConcurrent(root, lanes);
+  
+  if (exitStatus === RootInterrupted) {
+    // 被中断，保留当前工作
+    const remainingLanes = getRemainingLanes(root, lanes);
+    markRootFinished(root, remainingLanes);
+  } else if (exitStatus === RootCompleted) {
+    // 完成，提交更新
+    commitRoot(root);
+  }
+  
+  return getRemainingWork();
+}
+
+// 5. 检查是否应该让出执行权
+function shouldYieldToHost() {
+  const currentTime = performance.now();
+  
+  // 检查是否有更高优先级的更新
+  const hasHigherPriorityWork = 
+    (workInProgressRootRenderLanes & ~renderLanes) !== NoLanes;
+  
+  if (hasHigherPriorityWork) {
+    return true;  // 让出执行权
+  }
+  
+  // 检查时间片
+  if (currentTime >= deadline) {
+    return true;
+  }
+  
+  return false;
+}
+```
+
+### Lane 与 Expiration Time 的对比
+
+| 特性 | Expiration Time (React 16/17) | Lane (React 18) |
+|------|-----------------------------|-----------------|
+| 优先级表示 | 时间戳 | 二进制位 |
+| 优先级数量 | 有限（按时间） | 32 个独立通道 |
+| 优先级合并 | 时间比较 | 位运算（快速） |
+| 中断恢复 | 重新开始 | 部分恢复 |
+| 过渡支持 | 不支持 | 完整支持 |
+| 并发模式 | 不支持 | 原生支持 |
+
+### Lane 的实际应用
+
+#### 1. 用户输入优化
+
+```javascript
+// 文本输入场景
+function TextInput() {
+  const [text, setText] = useState('');
+  
+  function handleChange(e) {
+    // 用户输入：使用高优先级
+    // 保证输入响应及时
+    setText(e.target.value);
+  }
+  
+  function handleSearch() {
+    // 搜索：使用过渡优先级
+    // 可以被用户输入中断
+    startTransition(() => {
+      performSearch(text);
+    });
+  }
+  
+  return (
+    <input
+      value={text}
+      onChange={handleChange}
+      onKeyUp={handleSearch}
+    />
+  );
+}
+```
+
+#### 2. 列表渲染优化
+
+```javascript
+// 大列表滚动场景
+function VirtualList({ items }) {
+  const [visibleItems, setVisibleItems] = useState(items.slice(0, 50));
+  
+  function handleScroll() {
+    // 滚动事件：使用过渡优先级
+    // 可以被用户输入中断
+    startTransition(() => {
+      const newVisibleItems = calculateVisibleItems(items);
+      setVisibleItems(newVisibleItems);
+    });
+  }
+  
+  return (
+    <div onScroll={handleScroll}>
+      {visibleItems.map(item => (
+        <Item key={item.id} data={item} />
+      ))}
+    </div>
+  );
+}
+```
+
+#### 3. 数据获取优化
+
+```javascript
+// 数据获取场景
+function UserProfile() {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(false);
+  
+  async function fetchUserData() {
+    setLoading(true);
+    try {
+      // 数据获取：使用过渡优先级
+      // 可以被用户交互中断
+      await startTransition(async () => {
+        const data = await fetchUser();
+        setUser(data);
+      });
+    } finally {
+      setLoading(false);
+    }
+  }
+  
+  return (
+    <div>
+      <button onClick={fetchUserData}>Load User</button>
+      {loading && <div>Loading...</div>}
+      {user && <div>{user.name}</div>}
+    </div>
+  );
+}
+```
+
+### Lane 的优势总结
+
+1. **更精细的优先级控制**
+   - 32 个独立的优先级通道
+   - 支持优先级合并和拆分
+
+2. **更好的并发支持**
+   - 支持任务中断和恢复
+   - 避免重复工作
+
+3. **流畅的用户体验**
+   - 高优先级任务优先执行
+   - 低优先级任务优雅降级
+
+4. **高效的位运算**
+   - 快速的优先级比较
+   - 低开销的合并操作
+
+5. **过渡支持**
+   - 原生支持过渡动画
+   - 可中断的长时间任务
+
+### 总结
+
+**Lane 是 React 18 的核心优化之一，它通过二进制位的优先级模型解决了：**
+
+1. ✅ 优先级冲突问题
+2. ✅ 优先级中断和恢复问题
+3. ✅ 过渡中断问题
+4. ✅ 并发渲染的调度问题
+
+**Lane 的核心思想：**
+- 使用二进制位表示优先级
+- 通过位运算实现高效的优先级管理
+- 支持任务的优雅中断和恢复
+- 提供流畅的用户体验
+
+**Lane 的关键特性：**
+- 32 个独立的优先级通道
+- 位运算实现高效合并
+- 支持并发模式
+- 原生支持过渡动画
+
+---
+
+## 20、React高频Hooks手写(基础的SetState)
+
+### useState 实现
+
+```javascript
+let hooks = [];
+let hookIndex = 0;
+
+function useState(initialValue) {
+  const index = hookIndex;
+  
+  // 首次渲染时初始化状态
+  if (hooks[index] === undefined) {
+    hooks[index] = {
+      value: typeof initialValue === 'function' ? initialValue() : initialValue
+    };
+  }
+  
+  // 定义 setState 函数
+  const setState = (newValue) => {
+    const hook = hooks[index];
+    
+    // 如果新值与旧值相同，不触发更新
+    if (typeof newValue === 'function') {
+      const nextValue = newValue(hook.value);
+      if (nextValue === hook.value) return;
+      hook.value = nextValue;
+    } else {
+      if (newValue === hook.value) return;
+      hook.value = newValue;
+    }
+    
+    // 触发重新渲染
+    scheduleWork();
+  };
+  
+  hookIndex++;
+  return [hooks[index].value, setState];
+}
+
+// 模拟调度更新
+function scheduleWork() {
+  hookIndex = 0; // 重置 hook 索引
+  render(); // 触发重新渲染
+}
+
+function render() {
+  hookIndex = 0; // 重置 hook 索引
+  // 这里会执行组件函数
+  // 组件函数会依次调用 hooks
+}
+```
+
+### useEffect 实现
+
+```javascript
+function useEffect(callback, deps) {
+  const index = hookIndex;
+  
+  if (hooks[index] === undefined) {
+    hooks[index] = {
+      deps: undefined,
+      cleanup: undefined
+    };
+  }
+  
+  const hook = hooks[index];
+  const hasChangedDeps = hook.deps === undefined || 
+    deps.some((dep, i) => dep !== hook.deps[i]);
+  
+  if (hasChangedDeps) {
+    // 执行清理函数
+    if (hook.cleanup) {
+      hook.cleanup();
+    }
+    
+    // 执行副作用
+    hook.cleanup = callback();
+    hook.deps = deps;
+  }
+  
+  hookIndex++;
+}
+```
+
+### useMemo 实现
+
+```javascript
+function useMemo(factory, deps) {
+  const index = hookIndex;
+  
+  if (hooks[index] === undefined) {
+    hooks[index] = {
+      value: undefined,
+      deps: undefined
+    };
+  }
+  
+  const hook = hooks[index];
+  const hasChangedDeps = hook.deps === undefined || 
+    deps.some((dep, i) => dep !== hook.deps[i]);
+  
+  if (hasChangedDeps) {
+    hook.value = factory();
+    hook.deps = deps;
+  }
+  
+  hookIndex++;
+  return hook.value;
+}
+```
+
+### useCallback 实现
+
+```javascript
+function useCallback(callback, deps) {
+  return useMemo(() => callback, deps);
+}
+```
+
+### useRef 实现
+
+```javascript
+function useRef(initialValue) {
+  const index = hookIndex;
+  
+  if (hooks[index] === undefined) {
+    hooks[index] = {
+      current: initialValue
+    };
+  }
+  
+  hookIndex++;
+  return hooks[index];
+}
+```
+
+### useContext 实现
+
+```javascript
+function createContext(defaultValue) {
+  const context = {
+    Provider: null,
+    Consumer: null,
+    currentValue: defaultValue
+  };
+  
+  context.Provider = ({ value, children }) => {
+    context.currentValue = value;
+    return children;
+  };
+  
+  context.Consumer = ({ children }) => {
+    return children(context.currentValue);
+  };
+  
+  return context;
+}
+
+function useContext(context) {
+  return context.currentValue;
+}
+```
+
+---
+
+## 21、手写 React FiberNode 链表伪代码
+
+### FiberNode 结构
+
+```javascript
+// FiberNode 节点结构
+function FiberNode(tag, pendingProps, key) {
+  // 节点类型标签（函数组件、类组件、DOM节点等）
+  this.tag = tag;
+  
+  // key 用于 diff 算法
+  this.key = key;
+  
+  // 组件类型或 DOM 标签名
+  this.type = null;
+  
+  // 关联的 DOM 节点
+  this.stateNode = null;
+  
+  // Fiber 树结构
+  this.return = null;      // 父节点
+  this.child = null;       // 第一个子节点
+  this.sibling = null;     // 下一个兄弟节点
+  this.index = 0;          // 在兄弟节点中的索引
+  
+  // 属性和状态
+  this.pendingProps = pendingProps;  // 即将应用的 props
+  this.memoizedProps = null;          // 上次渲染使用的 props
+  this.memoizedState = null;          // 上次渲染后的 state
+  this.updateQueue = null;            // 更新队列
+  
+  // 副作用
+  this.flags = 0;                    // 副作用标记
+  this.subtreeFlags = 0;             // 子树副作用标记
+  this.deletions = null;             // 要删除的子节点
+  
+  // 优先级和调度
+  this.lanes = 0;                    // 优先级 lanes
+  this.childLanes = 0;               // 子树优先级 lanes
+  
+  // 双缓冲
+  this.alternate = null;             // 对应的另一个 Fiber 树节点
+}
+
+// 工作单元
+let workInProgress = null;
+let workInProgressRoot = null;
+
+// 构建 Fiber 树
+function reconcileChildren(current, workInProgress, nextChildren) {
+  if (current === null) {
+    // 首次渲染
+    workInProgress.child = mountChildFibers(
+      workInProgress,
+      null,
+      nextChildren
+    );
+  } else {
+    // 更新渲染
+    workInProgress.child = reconcileChildFibers(
+      workInProgress,
+      current.child,
+      nextChildren
+    );
+  }
+}
+
+// 协调单个子节点
+function reconcileSingleElement(returnFiber, currentFirstChild, element) {
+  const key = element.key;
+  let child = currentFirstChild;
+  
+  while (child !== null) {
+    // key 相同
+    if (child.key === key) {
+      const elementType = element.type;
+      if (child.elementType === elementType) {
+        // 复用节点
+        const existing = useFiber(child, element.props);
+        existing.return = returnFiber;
+        return existing;
+      }
+      // key 相同但类型不同，删除旧节点
+      deleteRemainingChildren(returnFiber, child);
+      break;
+    } else {
+      // key 不同，删除旧节点
+      deleteChild(returnFiber, child);
+    }
+    
+    child = child.sibling;
+  }
+  
+  // 创建新节点
+  const created = createFiberFromElement(element, returnFiber.mode, returnFiber.lanes);
+  created.return = returnFiber;
+  return created;
+}
+
+// 创建 Fiber 节点
+function createFiberFromElement(element, mode, lanes) {
+  const type = element.type;
+  const key = element.key;
+  const pendingProps = element.props;
+  
+  let fiberTag;
+  if (typeof type === 'string') {
+    fiberTag = HostComponent; // DOM 节点
+  } else if (typeof type === 'function') {
+    fiberTag = type.prototype.isReactComponent
+      ? ClassComponent
+      : FunctionComponent;
+  } else {
+    fiberTag = IndeterminateComponent;
+  }
+  
+  const fiber = createFiber(fiberTag, pendingProps, key, mode);
+  fiber.elementType = type;
+  fiber.type = type;
+  fiber.lanes = lanes;
+  
+  return fiber;
+}
+
+// 复用 Fiber 节点
+function useFiber(fiber, pendingProps) {
+  const clone = createWorkInProgress(fiber, pendingProps);
+  clone.index = 0;
+  clone.sibling = null;
+  return clone;
+}
+
+// 创建 workInProgress Fiber
+function createWorkInProgress(current, pendingProps) {
+  let workInProgress = current.alternate;
+  
+  if (workInProgress === null) {
+    // 首次创建
+    workInProgress = createFiber(
+      current.tag,
+      pendingProps,
+      current.key,
+      current.mode
+    );
+    workInProgress.elementType = current.elementType;
+    workInProgress.type = current.type;
+    workInProgress.stateNode = current.stateNode;
+    
+    workInProgress.alternate = current;
+    current.alternate = workInProgress;
+  } else {
+    // 复用 alternate
+    workInProgress.pendingProps = pendingProps;
+    workInProgress.type = current.type;
+    
+    // 清除副作用
+    workInProgress.flags = 0;
+    workInProgress.subtreeFlags = 0;
+  }
+  
+  workInProgress.childLanes = current.childLanes;
+  workInProgress.lanes = current.lanes;
+  workInProgress.child = current.child;
+  workInProgress.memoizedProps = current.memoizedProps;
+  workInProgress.memoizedState = current.memoizedState;
+  workInProgress.updateQueue = current.updateQueue;
+  
+  // 克隆依赖
+  const currentDependencies = current.dependencies;
+  workInProgress.dependencies =
+    currentDependencies === null
+      ? null
+      : {
+          lanes: currentDependencies.lanes,
+          firstContext: currentDependencies.firstContext,
+        };
+  
+  workInProgress.sibling = current.sibling;
+  workInProgress.index = current.index;
+  workInProgress.ref = current.ref;
+  
+  return workInProgress;
+}
+
+// 标记删除
+function deleteChild(returnFiber, childToDelete) {
+  if (!returnFiber.deletions) {
+    returnFiber.deletions = [childToDelete];
+    returnFiber.flags |= ChildDeletion;
+  } else {
+    returnFiber.deletions.push(childToDelete);
+  }
+}
+
+// 标记删除所有剩余子节点
+function deleteRemainingChildren(returnFiber, currentFirstChild) {
+  let childToDelete = currentFirstChild;
+  while (childToDelete !== null) {
+    deleteChild(returnFiber, childToDelete);
+    childToDelete = childToDelete.sibling;
+  }
+  return null;
+}
+
+// 标签常量
+const FunctionComponent = 0;
+const ClassComponent = 1;
+const IndeterminateComponent = 2;
+const HostRoot = 3;
+const HostPortal = 4;
+const HostComponent = 5;
+const HostText = 6;
+```
+
+---
+
+## 22、手写 React Scheduler涉及到核心微任务、宏任务代码
+
+### Scheduler 核心实现
+
+```javascript
+// 任务优先级定义
+const ImmediatePriority = 1;    // 同步任务
+const UserBlockingPriority = 2; // 用户阻塞任务
+const NormalPriority = 3;       // 普通任务
+const LowPriority = 4;          // 低优先级
+const IdlePriority = 5;         // 空闲任务
+
+// 任务队列
+let taskQueue = [];
+let currentTask = null;
+let isSchedulerPaused = false;
+let isHostCallbackScheduled = false;
+
+// 时间切片配置
+let frameInterval = 5; // 每帧可执行时间（ms）
+let frameDeadline = 0;
+
+// 任务对象结构
+function Task(callback, priorityLevel) {
+  this.callback = callback;
+  this.priorityLevel = priorityLevel;
+  this.startTime = performance.now();
+  this.expirationTime = this.startTime + getTimeoutByPriority(priorityLevel);
+}
+
+// 根据优先级获取超时时间
+function getTimeoutByPriority(priorityLevel) {
+  switch (priorityLevel) {
+    case ImmediatePriority:
+      return -1; // 立即执行
+    case UserBlockingPriority:
+      return 250; // 250ms
+    case NormalPriority:
+      return 5000; // 5s
+    case LowPriority:
+      return 10000; // 10s
+    case IdlePriority:
+      return 1073741823; // 永不超时
+    default:
+      return 5000;
+  }
+}
+
+// 调度任务
+function scheduleCallback(priorityLevel, callback) {
+  const currentTime = performance.now();
+  
+  const newTask = new Task(callback, priorityLevel);
+  
+  // 将任务加入队列（按过期时间排序）
+  taskQueue.push(newTask);
+  taskQueue.sort((a, b) => a.expirationTime - b.expirationTime);
+  
+  // 请求调度
+  requestHostCallback();
+  
+  return newTask;
+}
+
+// 请求宿主回调（使用 MessageChannel 实现宏任务）
+let scheduledHostCallback = null;
+let messageChannel = null;
+
+function requestHostCallback() {
+  if (!isHostCallbackScheduled) {
+    isHostCallbackScheduled = true;
+    requestHostTimeout(flushWork);
+  }
+}
+
+// 使用 MessageChannel 实现宏任务调度
+function setupMessageChannel() {
+  if (messageChannel) {
+    return;
+  }
+  
+  messageChannel = new MessageChannel();
+  const port = messageChannel.port2;
+  messageChannel.port1.onmessage = performWorkUntilDeadline;
+  
+  port.postMessage(null);
+}
+
+// 执行工作直到截止时间
+function performWorkUntilDeadline() {
+  if (isSchedulerPaused || scheduledHostCallback === null) {
+    return;
+  }
+  
+  const currentTime = performance.now();
+  
+  // 计算当前帧的截止时间
+  frameDeadline = currentTime + frameInterval;
+  
+  let hasMoreWork = true;
+  
+  try {
+    hasMoreWork = scheduledHostCallback(currentTime);
+  } finally {
+    if (hasMoreWork) {
+      // 还有工作，继续调度
+      port.postMessage(null);
+    } else {
+      isHostCallbackScheduled = false;
+    }
+  }
+}
+
+function requestHostTimeout(callback) {
+  scheduledHostCallback = callback;
+  setupMessageChannel();
+}
+
+// 刷新工作队列
+function flushWork(startTime) {
+  isHostCallbackScheduled = false;
+  
+  if (isSchedulerPaused) {
+    return false;
+  }
+  
+  let currentTime = startTime;
+  
+  // 获取第一个任务
+  currentTask = taskQueue.shift();
+  
+  while (currentTask !== null) {
+    // 检查任务是否过期
+    if (currentTask.expirationTime > currentTime && 
+        !shouldYieldToHost()) {
+      // 任务未过期且还有时间，继续执行
+      break;
+    }
+    
+    const callback = currentTask.callback;
+    
+    if (typeof callback === 'function') {
+      currentTask.callback = null;
+      
+      // 执行回调
+      const continuationCallback = callback(currentTask.expirationTime);
+      
+      // 如果返回新的回调，重新加入队列
+      if (typeof continuationCallback === 'function') {
+        currentTask.callback = continuationCallback;
+        taskQueue.push(currentTask);
+        taskQueue.sort((a, b) => a.expirationTime - b.expirationTime);
+      }
+    }
+    
+    // 获取下一个任务
+    currentTask = taskQueue.shift();
+  }
+  
+  return currentTask !== null;
+}
+
+// 检查是否应该让出执行权
+function shouldYieldToHost() {
+  const currentTime = performance.now();
+  
+  if (currentTime >= frameDeadline) {
+    // 时间片已用完
+    return true;
+  }
+  
+  return false;
+}
+
+// 暂停调度
+function pauseScheduler() {
+  isSchedulerPaused = true;
+}
+
+// 恢复调度
+function resumeScheduler() {
+  isSchedulerPaused = false;
+  if (isHostCallbackScheduled) {
+    requestHostTimeout(flushWork);
+  }
+}
+
+// 取消任务
+function cancelCallback(task) {
+  task.callback = null;
+}
+
+// 获取当前任务
+function getCurrentTask() {
+  return currentTask;
+}
+
+// 使用 requestIdleCallback 的备选方案（如果浏览器支持）
+let requestIdleCallbackImplementation = requestIdleCallback;
+let cancelIdleCallbackImplementation = cancelIdleCallback;
+
+if (typeof requestIdleCallback !== 'function') {
+  // 使用 setTimeout 模拟 requestIdleCallback
+  requestIdleCallbackImplementation = (callback, options) => {
+    const timeout = options && options.timeout;
+    const startTime = performance.now();
+    
+    const id = setTimeout(() => {
+      const endTime = performance.now();
+      const timeRemaining = Math.max(0, 50 - (endTime - startTime));
+      
+      callback({
+        didTimeout: timeRemaining <= 0,
+        timeRemaining: () => timeRemaining
+      });
+    }, timeout || 50);
+    
+    return id;
+  };
+  
+  cancelIdleCallbackImplementation = (id) => {
+    clearTimeout(id);
+  };
+}
+
+// 微任务调度（用于优先级较高的任务）
+let microtaskQueue = [];
+let isMicrotaskScheduled = false;
+
+function scheduleMicrotask(callback) {
+  microtaskQueue.push(callback);
+  
+  if (!isMicrotaskScheduled) {
+    isMicrotaskScheduled = true;
+    Promise.resolve().then(flushMicrotasks);
+  }
+}
+
+function flushMicrotasks() {
+  isMicrotaskScheduled = false;
+  
+  while (microtaskQueue.length > 0) {
+    const callback = microtaskQueue.shift();
+    callback();
+  }
+}
+
+// 示例：使用 Scheduler
+function workLoop(hasTimeRemaining, initialTime) {
+  let currentTime = initialTime;
+  
+  // 获取任务
+  currentTask = taskQueue.shift();
+  
+  while (currentTask !== null && 
+         (!hasTimeRemaining || currentTime < frameDeadline)) {
+    
+    const callback = currentTask.callback;
+    
+    if (typeof callback === 'function') {
+      // 执行任务
+      const continuationCallback = callback();
+      
+      if (typeof continuationCallback === 'function') {
+        // 任务未完成，重新加入队列
+        currentTask.callback = continuationCallback;
+        taskQueue.push(currentTask);
+        taskQueue.sort((a, b) => a.expirationTime - b.expirationTime);
+      }
+    } else {
+      // 任务已完成或被取消
+      taskQueue.shift();
+    }
+    
+    // 更新当前任务
+    currentTask = taskQueue[0];
+    currentTime = performance.now();
+  }
+  
+  // 返回是否还有工作
+  return currentTask !== null;
+}
+
+// 暴露 API
+const Scheduler = {
+  scheduleCallback,
+  cancelCallback,
+  getCurrentTask,
+  shouldYieldToHost,
+  pauseScheduler,
+  resumeScheduler,
+  scheduleMicrotask
+};
+
+export default Scheduler;
+```
+
+---
+
+## 23、React的同构开发你是如何部署的？使用Next还是自己开发的？流式渲染是什么有什么好处？
+
+### 同构开发部署方案
+
+#### 1. 使用 Next.js 部署
+
+**Next.js 是最成熟的 React SSR 方案**，我通常推荐使用 Next.js，原因如下：
+
+```javascript
+// Next.js 项目结构
+my-nextjs-app/
+├── pages/              # 路由页面
+│   ├── index.js       # 首页
+│   ├── _app.js        # 应用入口
+│   └── _document.js   # HTML 模板
+├── public/            # 静态资源
+├── styles/            # 样式文件
+├── package.json
+└── next.config.js
+```
+
+**部署流程：**
+
+```javascript
+// 1. 构建应用
+npm run build
+
+// 2. 启动生产环境
+npm start
+
+// 或者使用 Node.js 服务器
+node server.js
+
+// 3. 使用 Docker 部署
+// Dockerfile
+FROM node:18-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+RUN npm run build
+EXPOSE 3000
+CMD ["npm", "start"]
+
+// 4. 使用 Vercel 部署（Next.js 官方推荐）
+vercel --prod
+```
+
+**Next.js 的优势：**
+- 自动代码分割，按需加载
+- 内置图片优化、字体优化
+- API Routes 支持
+- ISR（增量静态再生）和 SSR 混合渲染
+- 优秀的开发体验（热更新、Fast Refresh）
+
+#### 2. 自研同构方案
+
+如果需要深度定制，可以自研：
+
+```javascript
+// 1. 服务器端渲染
 import express from 'express';
 import React from 'react';
 import { renderToString } from 'react-dom/server';
+import { StaticRouter } from 'react-router-dom/server';
 import App from './App';
 
 const app = express();
 
 app.get('*', (req, res) => {
-  // 1. 渲染 React 组件为 HTML 字符串
-  const html = renderToString(<App />);
+  const context = {};
   
-  // 2. 发送完整的 HTML
+  // 渲染 React 组件为 HTML
+  const html = renderToString(
+    <StaticRouter location={req.url} context={context}>
+      <App />
+    </StaticRouter>
+  );
+  
+  // 返回完整 HTML
   res.send(`
     <!DOCTYPE html>
     <html>
@@ -6058,5601 +7298,1818 @@ app.get('*', (req, res) => {
 });
 
 app.listen(3000);
+
+// 2. 客户端水合
+import { hydrateRoot } from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+import App from './App';
+
+hydrateRoot(
+  document.getElementById('root'),
+  <BrowserRouter>
+    <App />
+  </BrowserRouter>
+);
+
+// 3. Webpack 配置
+// webpack.server.js
+const path = require('path');
+
+module.exports = {
+  mode: 'development',
+  target: 'node',
+  entry: './server.js',
+  output: {
+    path: path.resolve(__dirname, 'build'),
+    filename: 'server.js',
+  },
+  module: {
+    rules: [
+      {
+        test: /\.js$/,
+        exclude: /node_modules/,
+        use: 'babel-loader',
+      },
+    ],
+  },
+};
+
+// webpack.client.js
+module.exports = {
+  mode: 'development',
+  entry: './client.js',
+  output: {
+    path: path.resolve(__dirname, 'public'),
+    filename: 'client.js',
+  },
+  module: {
+    rules: [
+      {
+        test: /\.js$/,
+        exclude: /node_modules/,
+        use: 'babel-loader',
+      },
+    ],
+  },
+};
 ```
 
-**2. 客户端 Hydration**
+### 流式渲染（Streaming SSR）
+
+**什么是流式渲染？**
+
+流式渲染是指在服务器端渲染时，将 HTML 分块逐步发送给浏览器，而不是等待整个页面渲染完成后一次性返回。
 
 ```javascript
-import React from 'react';
+// 使用 React 18 的流式渲染
+import { renderToPipeableStream } from 'react-dom/server';
+import App from './App';
+
+app.get('*', (req, res) => {
+  const { pipe } = renderToPipeableStream(
+    <App />,
+    {
+      // 当 shell 渲染完成时立即发送
+      onShellReady() {
+        res.statusCode = 200;
+        res.setHeader('Content-type', 'text/html');
+        pipe(res);
+      },
+      
+      // 处理错误
+      onShellError(error) {
+        res.statusCode = 500;
+        res.send('<!doctype html><p>Error loading app...</p>');
+      },
+      
+      // 客户端需要加载的 JS 文件
+      bootstrapModules: ['/client.js'],
+    }
+  );
+});
+
+// Next.js 13+ 的流式渲染
+export default function Page() {
+  // 自动启用流式渲染
+  return <div>Hello World</div>;
+}
+```
+
+**流式渲染的好处：**
+
+1. **更快的首屏渲染（FCP）**
+   - 页面 shell 可以立即发送给浏览器
+   - 用户可以更快看到页面框架
+   - FCP（First Contentful Paint）时间显著降低
+
+2. **更好的用户体验**
+   - 渐进式加载，用户感觉页面加载更快
+   - 减少白屏时间
+   - 提升 LCP（Largest Contentful Paint）指标
+
+3. **更高效的资源利用**
+   - 服务器可以边渲染边发送，不需要等待整个页面
+   - 减少内存占用
+   - 提高并发处理能力
+
+4. **支持 Suspense**
+   - 可以将耗时的数据获取部分标记为 Suspense
+   - 先渲染可用的内容，后续部分流式补充
+
+```javascript
+// 使用 Suspense 实现流式加载
+import { Suspense } from 'react';
+
+function UserProfile() {
+  return (
+    <div>
+      <h1>User Profile</h1>
+      <Suspense fallback={<div>Loading...</div>}>
+        <UserInfo />
+      </Suspense>
+      <Suspense fallback={<div>Loading posts...</div>}>
+        <UserPosts />
+      </Suspense>
+    </div>
+  );
+}
+```
+
+5. **更快的交互（TTI）**
+   - 页面内容分块加载，关键资源优先加载
+   - 减少阻塞渲染的 JS 大小
+   - 提前触发水合过程
+
+**性能对比：**
+
+| 指标 | 传统 SSR | 流式 SSR | 提升 |
+|------|---------|---------|------|
+| TTFB | 200ms | 50ms | 75% ↓ |
+| FCP | 800ms | 300ms | 62.5% ↓ |
+| LCP | 1500ms | 1200ms | 20% ↓ |
+| TTI | 2000ms | 1800ms | 10% ↓ |
+
+**实际应用场景：**
+
+1. **电商网站**
+   - 先渲染商品框架，再流式加载商品详情
+   - 用户可以立即看到页面结构
+
+2. **新闻网站**
+   - 先渲染标题和摘要，再流式加载正文
+   - 减少用户等待时间
+
+3. **社交媒体**
+   - 先渲染评论框架，再流式加载具体评论
+   - 提升用户体验
+
+---
+
+## 24、React服务端渲染需要进行Hydrate么？哪些版本需要？据我所了解Qwik是去调和的，为什么呢？
+
+### React SSR 是否需要 Hydrate
+
+**是的，React SSR 需要 Hydrate**，Hydrate 是 SSR 的关键步骤。
+
+#### 为什么需要 Hydrate？
+
+```javascript
+// 1. 服务器端渲染
+// server.js
+import { renderToString } from 'react-dom/server';
+import App from './App';
+
+const html = renderToString(<App />);
+// 返回的 HTML：
+// <div id="root"><h1>Hello</h1><button>Click</button></div>
+
+// 2. 客户端需要接管（Hydrate）
+// client.js
 import { hydrateRoot } from 'react-dom/client';
 import App from './App';
 
-// 将服务端渲染的 HTML "激活"为可交互的 React 组件
+// Hydrate：让 React 识别已有的 DOM，并添加事件监听器
 hydrateRoot(document.getElementById('root'), <App />);
 ```
 
-### SSR 的完整流程
+**Hydrate 的作用：**
+1. **事件绑定**：服务器返回的 HTML 是静态的，没有事件监听器。Hydrate 会为这些 DOM 元素绑定事件。
+2. **状态同步**：将服务器端的状态与客户端同步。
+3. **建立虚拟 DOM**：基于现有的 DOM 创建虚拟 DOM 树，为后续更新做准备。
 
+#### React 各版本的 Hydrate
+
+**React 16 及之前：**
 ```javascript
-// 服务端
-function handleRequest(req, res) {
-  // 1. 获取数据
-  const data = await fetchData(req.url);
-  
-  // 2. 渲染组件
-  const appHtml = renderToString(
-    <App data={data} />
-  );
-  
-  // 3. 注入初始数据（用于客户端 hydration）
-  const stateScript = `
-    <script>
-      window.__INITIAL_DATA__ = ${JSON.stringify(data)};
-    </script>
-  `;
-  
-  // 4. 返回 HTML
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <title>SSR App</title>
-      </head>
-      <body>
-        <div id="root">${appHtml}</div>
-        ${stateScript}
-        <script src="/client.js"></script>
-      </body>
-    </html>
-  `);
-}
-
-// 客户端
-function hydrate() {
-  // 1. 读取初始数据
-  const initialData = window.__INITIAL_DATA__;
-  
-  // 2. 使用初始数据渲染
-  hydrateRoot(
-    document.getElementById('root'),
-    <App data={initialData} />
-  );
-}
-
-hydrate();
+// 使用 hydrate
+import { hydrate } from 'react-dom';
+hydrate(<App />, document.getElementById('root'));
 ```
 
-### Next.js 的 SSR 实现
-
-**Next.js 13+ App Router：**
-
+**React 17：**
 ```javascript
-// app/page.js (服务端组件 - 默认)
-async function Page() {
-  // 数据获取自动在服务端执行
-  const data = await fetch('https://api.example.com/data', {
-    cache: 'force-cache', // 或 'no-store', 'revalidate'
-  });
-  
-  const posts = await data.json();
-  
-  return (
-    <div>
-      <h1>Blog Posts</h1>
-      {posts.map(post => (
-        <div key={post.id}>
-          <h2>{post.title}</h2>
-          <p>{post.content}</p>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-export default Page;
+// hydrate 仍然可用，但推荐使用 createRoot
+import { hydrate } from 'react-dom';
+hydrate(<App />, document.getElementById('root'));
 ```
 
-**服务端组件 vs 客户端组件：**
-
+**React 18：**
 ```javascript
-// 服务端组件（默认）
-// - 在服务端渲染
-// - 可以直接访问数据库和文件系统
-// - 减小客户端 bundle 大小
+// 使用 hydrateRoot（新 API）
+import { hydrateRoot } from 'react-dom/client';
+hydrateRoot(document.getElementById('root'), <App />);
 
-async function ServerComponent() {
-  const db = await connectDB();
-  const users = await db.getUsers();
-  
-  return (
-    <div>
-      {users.map(user => (
-        <div key={user.id}>{user.name}</div>
-      ))}
-    </div>
-  );
-}
-
-// 客户端组件（需要 'use client' 指令）
-'use client';
-
-import { useState } from 'react';
-
-function ClientComponent() {
-  const [count, setCount] = useState(0);
-  
-  return (
-    <button onClick={() => setCount(c => c + 1)}>
-      Count: {count}
-    </button>
-  );
-}
-
-// 混合使用
-async function Page() {
-  const data = await fetchData();
-  
-  return (
-    <div>
-      <ServerComponent data={data} />
-      <ClientComponent />
-    </div>
-  );
-}
+// 支持 Suspense 和流式渲染
+import { renderToPipeableStream } from 'react-dom/server';
 ```
 
-**静态生成（SSG）：**
+**所有版本的 React SSR 都需要 Hydrate**，这是 React 工作原理决定的。
+
+#### Hydrate 的问题
 
 ```javascript
-// 静态生成页面
-async function BlogPage({ params }) {
-  const { slug } = params;
-  const post = await getPostBySlug(slug);
-  
-  return (
-    <article>
-      <h1>{post.title}</h1>
-      <div dangerouslySetInnerHTML={{ __html: post.content }} />
-    </article>
-  );
-}
-
-// 生成静态页面时获取所有路径
-export async function generateStaticParams() {
-  const posts = await getAllPosts();
-  
-  return posts.map(post => ({
-    slug: post.slug,
-  }));
-}
-
-export default BlogPage;
-```
-
-**增量静态生成（ISR）：**
-
-```javascript
-// 设置重新验证时间
-export const revalidate = 3600; // 1小时
-
-async function Page() {
-  // 请求会被缓存，并在指定时间后重新生成
-  const res = await fetch('https://api.example.com/data', {
-    next: { revalidate: 3600 },
-  });
-  
-  const data = await res.json();
-  
-  return <div>{/* ... */}</div>;
-}
-```
-
-### SSR 的优势和挑战
-
-**优势：**
-
-```javascript
-// 1. SEO 优化
-// 搜索引擎可以直接抓取 HTML 内容
-// 不需要等待 JS 执行
-
-// 2. 首屏加载快
-// 用户可以立即看到内容
-// 减少 TTFB (Time to First Byte)
-
-// 3. 社交媒体分享
-// Open Graph 标签可以正确解析
-// 分享链接时显示预览图和描述
-
-// 4. 更好的性能
-// 减少客户端计算负担
-// 特别是在低性能设备上
-```
-
-**挑战：**
-
-```javascript
-// 1. 服务器负载增加
-// 每个请求都需要在服务端渲染
-
-// 2. 开发复杂度
-// 需要考虑服务端和客户端环境差异
-// 某些 API 只在浏览器可用（window, document）
-
-// 3. 状态管理复杂
-// 需要在服务端和客户端之间同步状态
-
-// 4. 数据获取策略
-// 需要决定哪些数据在服务端获取
-// 哪些数据在客户端获取
-```
-
-### 解决环境差异问题
-
-**检查运行环境：**
-
-```javascript
-// 方法1：检查 window 对象
-function isBrowser() {
-  return typeof window !== 'undefined';
-}
-
-function Component() {
-  if (isBrowser()) {
-    // 只在浏览器中执行的代码
-    const width = window.innerWidth;
-  }
-  
-  return <div>...</div>;
-}
-
-// 方法2：使用 useEffect（只在客户端执行）
-function Component() {
-  const [mounted, setMounted] = useState(false);
-  
-  useEffect(() => {
-    setMounted(true);
-  }, []);
-  
-  if (!mounted) {
-    return null; // 或显示加载状态
-  }
-  
-  return <div>{/* 浏览器专属内容 */}</div>;
-}
-```
-
-**处理 localStorage 等浏览器 API：**
-
-```javascript
-// 错误：服务端渲染时会报错
-function Component() {
-  const [theme, setTheme] = useState(
-    localStorage.getItem('theme') || 'light'
-  );
-  
-  return <div>...</div>;
-}
-
-// 正确：使用 useEffect
-function Component() {
-  const [theme, setTheme] = useState('light');
-  
-  useEffect(() => {
-    // 只在客户端执行
-    const savedTheme = localStorage.getItem('theme');
-    if (savedTheme) {
-      setTheme(savedTheme);
-    }
-  }, []);
-  
-  return <div>Theme: {theme}</div>;
-}
-```
-
-### Next.js 的优化特性
-
-**1. 自动代码分割**
-
-```javascript
-// 页面级别的代码分割自动进行
-// app/page.js → page.js
-// app/about/page.js → about/page.js
-
-// 路由懒加载
-// 只加载当前页面需要的代码
-```
-
-**2. 图片优化**
-
-```javascript
-import Image from 'next/image';
-
-function Page() {
-  return (
-    <Image
-      src="/hero.jpg"
-      alt="Hero image"
-      width={800}
-      height={600}
-      priority // 首屏图片，优先加载
-      placeholder="blur" // 模糊占位符
-    />
-  );
-}
-
-// 自动优化：
-// - 响应式图片（不同设备大小）
-// - 懒加载
-// - WebP/AVIF 格式
-// - 防止布局偏移
-```
-
-**3. 字体优化**
-
-```javascript
-import { Inter } from 'next/font/google';
-
-const inter = Inter({
-  subsets: ['latin'],
-  display: 'swap',
-});
-
-export default function Layout({ children }) {
-  return (
-    <html lang="en">
-      <body className={inter.className}>
-        {children}
-      </body>
-    </html>
-  );
-}
-
-// 自动优化：
-// - 自动自托管字体文件
-// - 零布局偏移
-// - 预加载字体
-```
-
-**4. 路由预加载**
-
-```javascript
-import Link from 'next/link';
-
-function Navigation() {
-  return (
-    <nav>
-      <Link href="/about" prefetch={true}>
-        About Page
-      </Link>
-      <Link href="/contact" prefetch={true}>
-        Contact Page
-      </Link>
-    </nav>
-  );
-}
-
-// 自动在浏览器空闲时预加载页面资源
-```
-
-### SSR 性能优化
-
-**1. 缓存策略**
-
-```javascript
-// 使用 React Cache
-import { cache } from 'react';
-
-const getData = cache(async (id) => {
-  const res = await fetch(`https://api.example.com/${id}`);
-  return res.json();
-});
-
-async function Page({ params }) {
-  const data = await getData(params.id);
-  return <div>{/* ... */}</div>;
-}
-
-// 相同的请求会被缓存，避免重复获取
-```
-
-**2. 流式渲染（Streaming SSR）**
-
-```javascript
-// 使用 Suspense 实现流式渲染
-import { Suspense } from 'react';
-
-async function Page() {
-  return (
-    <div>
-      <Header />
-      <Suspense fallback={<Loading />}>
-        <SlowComponent />
-      </Suspense>
-      <Footer />
-    </div>
-  );
-}
-
-// 页面分块发送，用户可以逐步看到内容
-// 而不是等待整个页面渲染完成
-```
-
-**3. 边缘函数**
-
-```javascript
-// next.config.js
-module.exports = {
-  experimental: {
-    // 在边缘节点执行
-    runtime: 'edge',
-  },
-};
-
-// 接近用户的位置处理请求
-// 减少延迟
-```
-
-### 总结
-
-**SSR 的核心价值：**
-
-1. **SEO 优化** - 搜索引擎友好
-2. **首屏性能** - 快速显示内容
-3. **用户体验** - 减少白屏时间
-4. **社交分享** - 正确的链接预览
-
-**Next.js 的优势：**
-
-1. **零配置** - 开箱即用的 SSR
-2. **文件系统路由** - 基于文件的路由
-3. **自动优化** - 图片、字体、代码分割
-4. **混合渲染** - SSR、SSG、ISR、CSR 灵活选择
-5. **开发体验** - 热重载、TypeScript 支持
-
-**选择策略：**
-
-| 场景 | 渲染方式 | Next.js 方案 |
-|------|---------|-------------|
-| 营销页面 | SSG | generateStaticParams |
-| 博客/文档 | ISR | revalidate |
-| 电商 | SSR | 服务端组件 |
-| 管理后台 | CSR | 客户端组件 |
-
----
-
-## 20、React中如何做性能优化？从渲染和代码层面分别说明。
-
-### 渲染层面的性能优化
-
-**1. 使用 React.memo 优化组件渲染**
-
-```javascript
-// ❌ 没有优化：每次父组件更新都会重新渲染
-const ExpensiveComponent = ({ items }) => {
-  console.log('ExpensiveComponent rendered');
-  return (
-    <ul>
-      {items.map(item => (
-        <li key={item.id}>{item.name}</li>
-      ))}
-    </ul>
-  );
-};
-
-// ✅ 使用 React.memo：只在 props 变化时重新渲染
-const MemoizedExpensiveComponent = React.memo(
-  ({ items }) => {
-    console.log('MemoizedExpensiveComponent rendered');
-    return (
-      <ul>
-        {items.map(item => (
-          <li key={item.id}>{item.name}</li>
-        ))}
-      </ul>
-    );
-  },
-  (prevProps, nextProps) => {
-    // 自定义比较函数
-    return prevProps.items.length === nextProps.items.length &&
-           prevProps.items.every((item, i) => 
-             item.id === nextProps.items[i].id
-           );
-  }
+// 问题1：Hydrate 不匹配
+// 服务端渲染
+const html = renderToString(<div>Hello</div>);
+
+// 客户端渲染
+hydrateRoot(
+  document.getElementById('root'),
+  <div>Hello World</div>  // 内容不匹配！
 );
+// 控制台警告：Hydration failed because the initial UI does not match
 
-function Parent() {
-  const [count, setCount] = useState(0);
-  const [items] = useState([
-    { id: 1, name: 'Item 1' },
-    { id: 2, name: 'Item 2' },
-  ]);
+// 问题2：Hydrate 性能开销
+// 需要遍历整个 DOM 树，对比虚拟 DOM
+// 对于大型应用，这可能导致阻塞
+
+// 问题3：JavaScript 必须完全加载才能交互
+// 用户看到页面后，仍需等待 JS 加载完成才能点击
+```
+
+### Qwik 为什么去 Hydrate？
+
+**Qwik 的核心理念：Resumability（可恢复性）**
+
+Qwik 不需要 Hydrate，原因如下：
+
+#### 1. Qwik 的工作原理
+
+```javascript
+// Qwik 组件
+import { component$, useSignal } from '@builder.io/qwik';
+
+export default component$(() => {
+  const count = useSignal(0);
   
   return (
     <div>
-      <button onClick={() => setCount(c => c + 1)}>
-        Count: {count}
+      <h1>Count: {count.value}</h1>
+      <button onClick$={() => count.value++}>
+        Increment
       </button>
-      <MemoizedExpensiveComponent items={items} />
     </div>
   );
-}
+});
+
+// 服务端渲染输出
+// HTML 包含了所有必要的信息，包括事件处理器
+<div>
+  <h1>Count: 0</h1>
+  <button 
+    on:click="/build/q-abc123.js#handler_increment"
+    q:id="1"
+  >
+    Increment
+  </button>
+</div>
+
+// 注意：HTML 中已经包含了事件处理器的引用
+// 不需要在客户端重新绑定事件
 ```
 
-**2. 使用 useMemo 缓存计算结果**
+#### 2. Qwik 与 React 的对比
+
+| 特性 | React SSR | Qwik |
+|------|----------|------|
+| 事件绑定 | 客户端 Hydrate 时绑定 | HTML 中直接包含 |
+| 状态管理 | 客户端重建状态 | HTML 中序列化状态 |
+| JS 加载 | 页面交互前必须加载 | 按需懒加载 |
+| 首次交互 | 等待 Hydrate 完成 | 立即可交互 |
+| 水合过程 | 遍历整个 DOM 树 | 无需水合 |
+
+#### 3. Qwik 的优势
 
 ```javascript
-function ExpensiveCalculation({ numbers }) {
-  // ❌ 没有优化：每次渲染都重新计算
-  const sum = numbers.reduce((acc, num) => acc + num, 0);
-  const sorted = numbers.sort((a, b) => a - b);
-  const filtered = numbers.filter(num => num > 10);
-  
-  // ✅ 使用 useMemo：只在依赖变化时重新计算
-  const memoizedSum = useMemo(() => {
-    console.log('Computing sum...');
-    return numbers.reduce((acc, num) => acc + num, 0);
-  }, [numbers]);
-  
-  const memoizedSorted = useMemo(() => {
-    console.log('Sorting...');
-    return [...numbers].sort((a, b) => a - b);
-  }, [numbers]);
-  
-  const memoizedFiltered = useMemo(() => {
-    console.log('Filtering...');
-    return numbers.filter(num => num > 10);
-  }, [numbers]);
-  
-  return (
-    <div>
-      <p>Sum: {memoizedSum}</p>
-      <p>Sorted: {JSON.stringify(memoizedSorted)}</p>
-      <p>Filtered: {JSON.stringify(memoizedFiltered)}</p>
-    </div>
-  );
-}
+// 1. 立即可交互
+// Qwik 应用在 HTML 返回后立即可交互
+// 不需要等待 JS 加载
+
+// 2. 代码分割粒度更细
+// 每个事件处理器都可以单独加载
+// 只在需要时才加载对应的 JS
+
+// 3. 更小的初始 JS 包
+// React 需要加载整个 React + 应用代码
+// Qwik 只加载必要的事件处理器
+
+// 4. 自动恢复
+// Qwik 会将状态序列化到 HTML 中
+// 客户端直接读取，无需重建
 ```
 
-**3. 使用 useCallback 缓存函数**
+#### 4. Qwik 实现细节
 
 ```javascript
-function Parent() {
-  const [count, setCount] = useState(0);
-  const [filter, setFilter] = useState('');
-  const [items] = useState([
-    { id: 1, name: 'Apple' },
-    { id: 2, name: 'Banana' },
-    { id: 3, name: 'Cherry' },
-  ]);
-  
-  // ❌ 没有优化：每次渲染都创建新函数
-  const handleClickBad = () => {
-    console.log('clicked');
-  };
-  
-  // ✅ 使用 useCallback：函数引用保持不变
-  const handleClickGood = useCallback(() => {
-    console.log('clicked');
-  }, []); // 空依赖数组
-  
-  // ✅ 有依赖的情况
-  const handleFilter = useCallback((text) => {
-    setFilter(text);
-  }, []);
-  
-  // ✅ 传递给 memo 组件
-  const MemoizedItem = React.memo(({ item, onClick }) => {
-    console.log(`Item ${item.id} rendered`);
-    return (
-      <li onClick={() => onClick(item.id)}>
-        {item.name}
-      </li>
-    );
-  });
-  
-  const handleItemClick = useCallback((id) => {
-    console.log('Item clicked:', id);
-  }, []);
-  
-  const filteredItems = useMemo(() => {
-    return items.filter(item => 
-      item.name.toLowerCase().includes(filter.toLowerCase())
-    );
-  }, [items, filter]);
-  
-  return (
-    <div>
-      <button onClick={() => setCount(c => c + 1)}>
-        Count: {count}
-      </button>
-      <input 
-        value={filter}
-        onChange={(e) => handleFilter(e.target.value)}
-        placeholder="Filter..."
-      />
-      <ul>
-        {filteredItems.map(item => (
-          <MemoizedItem 
-            key={item.id} 
-            item={item} 
-            onClick={handleItemClick} 
-          />
-        ))}
-      </ul>
-    </div>
-  );
-}
+// Qwik 的懒加载机制
+// HTML 中的特殊属性
+<button 
+  on:click="/build/q-abc123.js#handler_increment"  // 事件处理器路径
+  q:id="1"                                         // 元素 ID
+>
+  Increment
+</button>
+
+// 当用户点击按钮时：
+// 1. Qwik 运行时拦截事件
+// 2. 动态加载对应的 JS 文件：/build/q-abc123.js
+// 3. 执行事件处理器
+// 4. 更新 DOM（使用 fine-grained reactivity）
+
+// 状态序列化
+<script q:json="state">
+  {
+    "count": 0,
+    "user": { "name": "John" }
+  }
+</script>
+
+// 客户端直接读取状态，无需水合
 ```
 
-**4. 虚拟化长列表**
+#### 5. React 的未来方向
+
+React 也在探索类似的优化：
 
 ```javascript
-import { FixedSizeList } from 'react-window';
-
-function VirtualizedList({ items }) {
-  // ❌ 渲染所有项（性能差）
-  return (
-    <ul style={{ height: '400px', overflow: 'auto' }}>
-      {items.map(item => (
-        <li key={item.id} style={{ height: '50px' }}>
-          {item.name}
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-// ✅ 使用 react-window 虚拟化
-function OptimizedList({ items }) {
-  const Row = ({ index, style }) => (
-    <div style={style}>
-      {items[index].name}
-    </div>
-  );
-  
-  return (
-    <FixedSizeList
-      height={400}
-      itemCount={items.length}
-      itemSize={50}
-      width="100%"
-    >
-      {Row}
-    </FixedSizeList>
-  );
-}
-
-// 使用示例
-function App() {
-  const [items] = useState(
-    Array(10000).fill(0).map((_, i) => ({ id: i, name: `Item ${i}` }))
-  );
-  
-  return <OptimizedList items={items} />;
-}
-```
-
-**5. 懒加载组件**
-
-```javascript
-import { lazy, Suspense } from 'react';
-
-// ❌ 导入时立即加载
-import HeavyComponent from './HeavyComponent';
-
-// ✅ 使用 lazy 懒加载
-const LazyHeavyComponent = lazy(() => import('./HeavyComponent'));
-
-function App() {
-  const [showHeavy, setShowHeavy] = useState(false);
-  
-  return (
-    <div>
-      <button onClick={() => setShowHeavy(true)}>
-        Show Heavy Component
-      </button>
-      
-      {showHeavy && (
-        <Suspense fallback={<div>Loading...</div>}>
-          <LazyHeavyComponent />
-        </Suspense>
-      )}
-    </div>
-  );
-}
-
-// 懒加载路由
-import { lazy, Suspense } from 'react';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
-
-const Home = lazy(() => import('./pages/Home'));
-const About = lazy(() => import('./pages/About'));
-const Contact = lazy(() => import('./pages/Contact'));
+// React 18 的 Partial Hydration（部分水合）
+import { Suspense } from 'react';
 
 function App() {
   return (
-    <BrowserRouter>
-      <Suspense fallback={<div>Loading page...</div>}>
-        <Routes>
-          <Route path="/" element={<Home />} />
-          <Route path="/about" element={<About />} />
-          <Route path="/contact" element={<Contact />} />
-        </Routes>
+    <div>
+      <Header />           {/* 立即水合 */}
+      <Suspense fallback={<Loading />}>
+        <HeavyComponent /> {/* 延迟水合 */}
       </Suspense>
-    </BrowserRouter>
-  );
-}
-```
-
-**6. 使用 useTransition 优化用户体验**
-
-```javascript
-import { useTransition } from 'react';
-
-function SearchComponent() {
-  const [query, setQuery] = useState('');
-  const [results, setResults] = useState([]);
-  const [isPending, startTransition] = useTransition();
-  
-  const handleSearch = (value) => {
-    // 高优先级更新：立即执行
-    setQuery(value);
-    
-    // 低优先级更新：可中断，不阻塞 UI
-    startTransition(() => {
-      const filtered = performExpensiveSearch(value);
-      setResults(filtered);
-    });
-  };
-  
-  return (
-    <div>
-      <input
-        value={query}
-        onChange={(e) => handleSearch(e.target.value)}
-        placeholder="Search..."
-      />
-      {isPending && <div>Searching...</div>}
-      <ul>
-        {results.map(result => (
-          <li key={result.id}>{result.name}</li>
-        ))}
-      </ul>
     </div>
   );
 }
-```
 
-**7. 使用 key 优化列表渲染**
-
-```javascript
-// ❌ 使用索引作为 key（列表会变化时）
-function BadList({ items }) {
-  return (
-    <ul>
-      {items.map((item, index) => (
-        <li key={index}>
-          {item.name}
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-// ✅ 使用稳定的唯一 ID
-function GoodList({ items }) {
-  return (
-    <ul>
-      {items.map(item => (
-        <li key={item.id}>
-          {item.name}
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-// 问题场景：插入新项
-// 初始: [A, B, C]
-// 插入 D: [D, A, B, C]
-
-// 使用索引 key：
-// - A 变成 D
-// - B 变成 A
-// - C 变成 B
-// - 创建 C
-// 导致不必要的更新
-
-// 使用 ID key：
-// - 只插入 D
-// - A, B, C 保持不变
-// 性能更好
-```
-
-### 代码层面的性能优化
-
-**1. 避免内联函数定义**
-
-```javascript
-// ❌ 每次渲染都创建新函数
-function BadComponent() {
-  const [count, setCount] = useState(0);
-  
-  return (
-    <button 
-      onClick={() => setCount(c => c + 1)} // 每次渲染都是新函数
-    >
-      Click
-    </button>
-  );
-}
-
-// ✅ 使用 useCallback 或类方法
-function GoodComponent() {
-  const [count, setCount] = useState(0);
-  
-  const handleClick = useCallback(() => {
-    setCount(c => c + 1);
-  }, []);
-  
-  return <button onClick={handleClick}>Click</button>;
-}
-
-// 或者使用 bind（但不推荐）
-class Component extends React.Component {
-  handleClick = () => {
-    this.setState(prev => ({ count: prev.count + 1 }));
-  }
-  
-  render() {
-    return <button onClick={this.handleClick}>Click</button>;
-  }
-}
-```
-
-**2. 避免在渲染时创建对象**
-
-```javascript
-// ❌ 每次渲染都创建新对象
-function BadComponent() {
-  const [count, setCount] = useState(0);
-  
-  return (
-    <Child 
-      config={{ theme: 'dark', color: 'red' }} // 每次渲染都是新对象
-      style={{ padding: '10px', margin: '5px' }}
-    />
-  );
-}
-
-// ✅ 使用 useMemo 缓存对象
-function GoodComponent() {
-  const [count, setCount] = useState(0);
-  
-  const config = useMemo(() => ({
-    theme: 'dark',
-    color: 'red'
-  }), []);
-  
-  const style = useMemo(() => ({
-    padding: '10px',
-    margin: '5px'
-  }), []);
-  
-  return <Child config={config} style={style} />;
-}
-```
-
-**3. 合理使用 shouldComponentUpdate 和 React.PureComponent**
-
-```javascript
-// 类组件中使用 React.PureComponent
-class MyComponent extends React.PureComponent {
-  // 自动实现 shouldComponentUpdate
-  // 对 props 和 state 进行浅比较
-  
-  render() {
-    return <div>{this.props.value}</div>;
-  }
-}
-
-// 手动实现 shouldComponentUpdate
-class MyComponent extends React.Component {
-  shouldComponentUpdate(nextProps, nextState) {
-    // 只在特定条件时更新
-    return nextProps.id !== this.props.id ||
-           nextProps.value !== this.props.value;
-  }
-  
-  render() {
-    return <div>{this.props.value}</div>;
-  }
-}
-```
-
-**4. 避免不必要的状态**
-
-```javascript
-// ❌ 从 props 派生的状态
-function BadComponent({ user }) {
-  const [fullName, setFullName] = useState('');
-  
-  useEffect(() => {
-    setFullName(`${user.firstName} ${user.lastName}`);
-  }, [user]);
-  
-  return <div>{fullName}</div>;
-}
-
-// ✅ 直接使用 props 或 useMemo
-function GoodComponent({ user }) {
-  const fullName = useMemo(
-    () => `${user.firstName} ${user.lastName}`,
-    [user.firstName, user.lastName]
-  );
-  
-  return <div>{fullName}</div>;
-}
-
-// ❌ 冗余的状态
-function BadForm() {
-  const [name, setName] = useState('');
-  const [email, setEmail] = useState('');
-  const [isValid, setIsValid] = useState(false);
-  
-  useEffect(() => {
-    setIsValid(name.length > 0 && email.includes('@'));
-  }, [name, email]);
-  
-  return (
-    <form>
-      <input value={name} onChange={e => setName(e.target.value)} />
-      <input value={email} onChange={e => setEmail(e.target.value)} />
-      <button disabled={!isValid}>Submit</button>
-    </form>
-  );
-}
-
-// ✅ 派生值
-function GoodForm() {
-  const [name, setName] = useState('');
-  const [email, setEmail] = useState('');
-  
-  const isValid = name.length > 0 && email.includes('@');
-  
-  return (
-    <form>
-      <input value={name} onChange={e => setName(e.target.value)} />
-      <input value={email} onChange={e => setEmail(e.target.value)} />
-      <button disabled={!isValid}>Submit</button>
-    </form>
-  );
-}
-```
-
-**5. 优化依赖数组**
-
-```javascript
-// ❌ 过大的依赖数组
-function BadComponent() {
-  const [state, setState] = useState({
-    user: null,
-    posts: [],
-    comments: [],
-    likes: [],
-    settings: {},
-    theme: 'light'
-  });
-  
-  useEffect(() => {
-    // 任何状态变化都会触发
-    console.log('Effect ran');
-  }, [state]);
-  
-  return <div>...</div>;
-}
-
-// ✅ 精确的依赖
-function GoodComponent() {
-  const [user, setUser] = useState(null);
-  const [posts, setPosts] = useState([]);
-  const [theme, setTheme] = useState('light');
-  
-  useEffect(() => {
-    // 只有 user 变化时触发
-    console.log('User effect ran');
-  }, [user]);
-  
-  useEffect(() => {
-    // 只有 posts 变化时触发
-    console.log('Posts effect ran');
-  }, [posts]);
-  
-  return <div>...</div>;
-}
-```
-
-**6. 使用生产环境构建**
-
-```javascript
-// 开发环境 vs 生产环境
-
-// 开发环境：
-// - 包含额外的警告
-// - 包含 React DevTools 集成
-// - 未压缩的代码
-// - 较大的 bundle 大小
-
-// 生产环境：
-// - 移除警告和调试代码
-// - 压缩和优化代码
-// - 较小的 bundle 大小
-// - 更好的性能
-
-// 构建命令
-// 开发
-npm run dev
-
-// 生产
-npm run build
-npm run start
-
-// 或者
-NODE_ENV=production npm run build
-```
-
-### 使用 React DevTools Profiler
-
-```javascript
-// React DevTools Profiler 可以帮助识别性能瓶颈
-
-// 1. 安装 React DevTools 浏览器扩展
-
-// 2. 在开发环境使用 Profiler
-import { Profiler } from 'react';
-
-function onRenderCallback(
-  id, // 组件的 id
-  phase, // 'mount' 或 'update'
-  actualDuration, // 组件渲染花费的时间（ms）
-  baseDuration, // 未使用 memo 时的渲染时间
-  startTime, // 渲染开始的时间
-  commitTime, // 提交的时间
-  interactions // 本次更新涉及的 interactions
-) {
-  console.log({
-    id,
-    phase,
-    actualDuration,
-    baseDuration,
-    interactions
-  });
-}
-
-function App() {
-  return (
-    <Profiler id="App" onRender={onRenderCallback}>
-      <Navigation />
-      <Router />
-      <Footer />
-    </Profiler>
-  );
-}
-
-// 3. 分析 Profiler 数据
-// - 找出渲染时间长的组件
-// - 找出不必要渲染的组件
-// - 优化热点组件
-```
-
-### 性能优化清单
-
-```javascript
-// 渲染优化
-✓ 使用 React.memo 避免不必要的重渲染
-✓ 使用 useMemo 缓存昂贵的计算
-✓ 使用 useCallback 缓存函数
-✓ 使用虚拟化处理长列表
-✓ 懒加载组件和路由
-✓ 使用 useTransition 优化用户体验
-✓ 使用正确的 key 优化列表
-
-// 代码优化
-✓ 避免内联函数定义
-✓ 避免在渲染时创建对象
-✓ 合理使用 shouldComponentUpdate
-✓ 避免不必要的状态
-✓ 优化依赖数组
-✓ 使用生产环境构建
-
-// 工具
-✓ 使用 React DevTools Profiler
-✓ 使用 Lighthouse 进行性能审计
-✓ 使用 webpack-bundle-analyzer 分析 bundle
+// React Server Components（服务器组件）
+// 不需要发送到客户端，减少 JS 大小
 ```
 
 ### 总结
 
-**性能优化的核心原则：**
+**React 必须进行 Hydrate**，因为：
+1. React 组件是动态的，需要事件绑定和状态管理
+2. React 的工作原理依赖于虚拟 DOM 和 Diff 算法
+3. 所有版本（16/17/18）都需要 Hydrate
 
-1. **先测量，再优化** - 使用 Profiler 识别瓶颈
-2. **避免不必要的渲染** - React.memo, useMemo, useCallback
-3. **减少渲染工作量** - 虚拟化、懒加载、代码分割
-4. **优化关键路径** - useTransition, Suspense
-5. **代码层面优化** - 避免重复计算和创建对象
+**Qwik 不需要 Hydrate**，因为：
+1. 采用 Resumable 架构，状态和事件处理器都序列化到 HTML 中
+2. 使用 fine-grained reactivity，无需虚拟 DOM
+3. 按需懒加载，减少初始 JS 大小
+4. 立即可交互，无需等待水合
 
-**常见的性能陷阱：**
-
-- 过度优化（先测量！）
-- 错误使用 useMemo/useCallback
-- 忽略 key 的作用
-- 不必要的 props 传递
-- 过大的组件状态
-
-**最佳实践：**
-
-- 保持组件小而专注
-- 使用组合而非继承
-- 合理拆分组件
-- 利用 React 的自动优化
-- 在必要时手动优化
+**Qwik 的权衡：**
+- 优势：更快的交互、更小的 JS 包、更好的性能
+- 劣势：不同的开发范式、生态系统较小、学习成本
 
 ---
 
-## 21、React Suspense 是什么？它解决了什么问题？
+## 25、React同构渲染如果提高性能问题？你是怎么落地的。同构解决了哪些性能指标。
 
-### Suspense 概述
+### React 同构渲染性能优化方案
 
-**Suspense** 是 React 提供的一种声明式处理异步操作（如数据获取、代码分割）的机制。它允许组件"等待"某些操作完成，并在等待期间显示 fallback UI。
-
-### Suspense 的基本用法
-
-**1. 代码分割（Code Splitting）**
+#### 1. 缓存策略
 
 ```javascript
+// Redis 缓存渲染结果
+import Redis from 'ioredis';
+
+const redis = new Redis();
+
+async function renderWithCache(req, res, next) {
+  const cacheKey = `ssr:${req.url}`;
+  
+  // 尝试从缓存读取
+  const cachedHtml = await redis.get(cacheKey);
+  
+  if (cachedHtml) {
+    res.setHeader('X-Cache', 'HIT');
+    return res.send(cachedHtml);
+  }
+  
+  // 渲染页面
+  const html = await renderApp(req);
+  
+  // 缓存结果（5分钟过期）
+  await redis.setex(cacheKey, 300, html);
+  
+  res.setHeader('X-Cache', 'MISS');
+  res.send(html);
+}
+```
+
+#### 2. 代码分割和懒加载
+
+```javascript
+// 动态导入组件
 import { lazy, Suspense } from 'react';
 
-// 懒加载组件
 const HeavyComponent = lazy(() => import('./HeavyComponent'));
+const AdminPanel = lazy(() => import('./AdminPanel'));
 
 function App() {
   return (
     <div>
-      <Suspense fallback={<div>Loading component...</div>}>
-        <HeavyComponent />
+      <Suspense fallback={<Loading />}>
+        <Route path="/heavy" component={HeavyComponent} />
+        <Route path="/admin" component={AdminPanel} />
       </Suspense>
     </div>
   );
 }
 
-// 路由级别的代码分割
-import { lazy, Suspense } from 'react';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+// 服务端也支持代码分割
+import { renderToPipeableStream } from 'react-dom/server';
 
-const Home = lazy(() => import('./pages/Home'));
-const About = lazy(() => import('./pages/About'));
-const Contact = lazy(() => import('./pages/Contact'));
-
-function App() {
-  return (
-    <BrowserRouter>
-      <Suspense fallback={<div>Loading page...</div>}>
-        <Routes>
-          <Route path="/" element={<Home />} />
-          <Route path="/about" element={<About />} />
-          <Route path="/contact" element={<Contact />} />
-        </Routes>
-      </Suspense>
-    </BrowserRouter>
-  );
-}
-```
-
-**2. 数据获取（React 18+）**
-
-```javascript
-// 定义数据获取函数
-import { Suspense } from 'react';
-
-let cache = new Map();
-
-function fetchUser(id) {
-  if (cache.has(id)) {
-    return cache.get(id);
-  }
-  
-  const promise = fetch(`/api/users/${id}`)
-    .then(res => res.json())
-    .then(user => {
-      cache.set(id, user);
-      return user;
-    });
-  
-  cache.set(id, promise);
-  throw promise; // 抛出 Promise 给 Suspense 捕获
-}
-
-function UserProfile({ userId }) {
-  const user = fetchUser(userId); // 直接调用，不需要 useEffect
-  
-  return (
-    <div>
-      <h1>{user.name}</h1>
-      <p>Email: {user.email}</p>
-    </div>
-  );
-}
-
-function App() {
-  return (
-    <Suspense fallback={<div>Loading user...</div>}>
-      <UserProfile userId={1} />
-    </Suspense>
-  );
-}
-```
-
-### Suspense 的工作原理
-
-**1. 抛出 Promise**
-
-```javascript
-// Suspense 通过捕获 Promise 来工作
-function AsyncComponent() {
-  const data = fetchData(); // 返回 Promise 或数据
-  
-  return <div>{data}</div>;
-}
-
-// fetchData 的实现
-function fetchData() {
-  if (dataCache) {
-    return dataCache; // 已有数据，直接返回
-  }
-  
-  const promise = fetch('/api/data').then(res => res.json());
-  throw promise; // 抛出 Promise
-}
-
-// Suspense 捕获这个 Promise
-<Suspense fallback={<Loading />}>
-  <AsyncComponent />
-</Suspense>
-```
-
-**2. 渲染流程**
-
-```javascript
-// 第一次渲染：
-// 1. 渲染 AsyncComponent
-// 2. fetchData() 抛出 Promise
-// 3. Suspense 捕获 Promise
-// 4. 显示 fallback UI
-
-// Promise resolve 后：
-// 1. React 重新渲染
-// 2. fetchData() 返回数据
-// 3. 渲染实际内容
-```
-
-### Suspense 的高级用法
-
-**1. 嵌套 Suspense**
-
-```javascript
-function App() {
-  return (
-    <div>
-      <Suspense fallback={<div>Loading page...</div>}>
-        <Header />
-        <Suspense fallback={<div>Loading posts...</div>}>
-          <Posts />
-        </Suspense>
-        <Suspense fallback={<div>Loading comments...</div>}>
-          <Comments />
-        </Suspense>
-        <Footer />
-      </Suspense>
-    </div>
-  );
-}
-
-// 每个 Suspense 独立处理其子组件的异步操作
-```
-
-**2. SuspenseList（React 18+）**
-
-```javascript
-import { Suspense, SuspenseList } from 'react';
-
-function App() {
-  return (
-    <SuspenseList revealOrder="forwards" tail="hidden">
-      <Suspense fallback={<div>Loading post 1...</div>}>
-        <Post id={1} />
-      </Suspense>
-      <Suspense fallback={<div>Loading post 2...</div>}>
-        <Post id={2} />
-      </Suspense>
-      <Suspense fallback={<div>Loading post 3...</div>}>
-        <Post id={3} />
-      </Suspense>
-    </SuspenseList>
-  );
-}
-
-// revealOrder 选项：
-// - 'forwards': 从前到后显示
-// - 'backwards': 从后到前显示
-// - 'together': 同时显示所有内容
-
-// tail 选项：
-// - 'hidden': 隐藏未加载的内容
-// - 'collapsed': 显示占位空间
-```
-
-**3. 错误边界 + Suspense**
-
-```javascript
-import { Suspense } from 'react';
-
-class ErrorBoundary extends React.Component {
-  state = { hasError: false, error: null };
-  
-  static getDerivedStateFromError(error) {
-    return { hasError: true };
-  }
-  
-  componentDidCatch(error, errorInfo) {
-    this.setState({ error });
-  }
-  
-  render() {
-    if (this.state.hasError) {
-      return (
-        <div>
-          <h2>Error loading content</h2>
-          <p>{this.state.error?.message}</p>
-        </div>
-      );
+app.get('/', (req, res) => {
+  const { pipe } = renderToPipeableStream(
+    <App />,
+    {
+      bootstrapModules: ['/client.js'],
+      // 按需加载 chunks
+      onAllReady() {
+        pipe(res);
+      }
     }
-    
-    return this.props.children;
-  }
-}
-
-function App() {
-  return (
-    <ErrorBoundary>
-      <Suspense fallback={<div>Loading...</div>}>
-        <AsyncComponent />
-      </Suspense>
-    </ErrorBoundary>
   );
-}
-
-// 结合使用：
-// - Suspense 处理加载状态
-// - ErrorBoundary 处理错误状态
+});
 ```
 
-### 使用 React Query 配合 Suspense
+#### 3. 数据预取和缓存
 
 ```javascript
-import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
-import { Suspense } from 'react';
+// 数据预取中间件
+import { QueryCache, QueryClient } from '@tanstack/react-query';
 
-// 创建 QueryClient
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      suspense: true, // 启用 Suspense 模式
-    },
-  },
-});
+const queryCache = new QueryCache();
+const queryClient = new QueryClient({ queryCache });
 
-function UserProfile({ userId }) {
-  // useQuery 自动抛出 Promise
-  const { data: user } = useQuery({
-    queryKey: ['user', userId],
-    queryFn: () => fetch(`/api/users/${userId}`).then(res => res.json()),
+async function prefetchData(req, res, next) {
+  // 为 SSR 预取数据
+  await queryClient.prefetchQuery(['user'], fetchUser);
+  
+  // 将 QueryClient 状态传递给客户端
+  const dehydratedState = dehydrate(queryClient);
+  
+  res.locals.dehydratedState = dehydratedState;
+  next();
+}
+
+// 服务端组件使用数据
+function UserList() {
+  const { data } = useQuery(['users'], fetchUsers, {
+    staleTime: 5000, // 5秒内使用缓存
+    cacheTime: 10000, // 缓存10秒
   });
   
-  return (
-    <div>
-      <h1>{user.name}</h1>
-      <p>Email: {user.email}</p>
-    </div>
-  );
+  return <div>{/* 渲染用户列表 */}</div>;
 }
 
-function App() {
+// 客户端恢复状态
+function App({ dehydratedState }) {
+  const [queryClient] = useState(() => 
+    new QueryClient({
+      defaultOptions: { queries: { staleTime: 5000 } }
+    })
+  );
+  
   return (
     <QueryClientProvider client={queryClient}>
-      <Suspense fallback={<div>Loading user...</div>}>
-        <UserProfile userId={1} />
-      </Suspense>
+      <Hydrate state={dehydratedState}>
+        <UserList />
+      </Hydrate>
     </QueryClientProvider>
   );
 }
 ```
 
-### 流式渲染（Streaming）
+#### 4. CDN 和静态资源优化
 
 ```javascript
-// Next.js 13+ App Router 中的 Suspense
-import { Suspense } from 'react';
-
-// 顶层布局
-export default function Layout({ children }) {
-  return (
-    <html>
-      <body>
-        <Navbar />
-        <main>{children}</main>
-        <Footer />
-      </body>
-    </html>
-  );
-}
-
-// 页面组件
-async function Page() {
-  const data = await fetchData();
-  
-  return (
-    <div>
-      <h1>{data.title}</h1>
-      
-      {/* 流式渲染不同部分 */}
-      <Suspense fallback={<div>Loading content...</div>}>
-        <Content />
-      </Suspense>
-      
-      <Suspense fallback={<div>Loading comments...</div>}>
-        <Comments />
-      </Suspense>
-    </div>
-  );
-}
-
-// 优点：
-// - 页面分块发送
-// - 用户逐步看到内容
-// - 减少首屏加载时间
-```
-
-### Suspense 解决的问题
-
-**1. 声明式异步处理**
-
-```javascript
-// ❌ 命令式：使用 loading state
-function OldComponent() {
-  const [loading, setLoading] = useState(true);
-  const [data, setData] = useState(null);
-  
-  useEffect(() => {
-    fetchData().then(data => {
-      setData(data);
-      setLoading(false);
-    });
-  }, []);
-  
-  if (loading) {
-    return <div>Loading...</div>;
-  }
-  
-  return <div>{data}</div>;
-}
-
-// ✅ 声明式：使用 Suspense
-function NewComponent() {
-  const data = fetchData();
-  return <div>{data}</div>;
-}
-
-function App() {
-  return (
-    <Suspense fallback={<div>Loading...</div>}>
-      <NewComponent />
-    </Suspense>
-  );
-}
-```
-
-**2. 避免 Waterfall 问题**
-
-```javascript
-// ❌ Waterfall：串行获取数据
-async function OldComponent() {
-  const user = await fetchUser();
-  const posts = await fetchPosts(user.id); // 等待 user
-  const comments = await fetchComments(posts); // 等待 posts
-  
-  return <div>{/* ... */}</div>;
-}
-
-// ✅ 并行获取
-function NewComponent() {
-  return (
-    <Suspense fallback={<div>Loading...</div>}>
-      <UserComponent />
-      <PostsComponent />
-      <CommentsComponent />
-    </Suspense>
-  );
-}
-
-// 每个组件独立获取数据
-function UserComponent() {
-  const user = fetchUser();
-  return <div>{user.name}</div>;
-}
-
-function PostsComponent() {
-  const posts = fetchPosts();
-  return <div>{posts.map(p => p.title)}</div>;
-}
-```
-
-**3. 更好的代码组织**
-
-```javascript
-// ❌ 混合了 UI 和数据逻辑
-function OldComponent() {
-  const [data, setData] = useState(null);
-  const [error, setError] = useState(null);
-  const [loading, setLoading] = useState(true);
-  
-  useEffect(() => {
-    fetchData()
-      .then(setData)
-      .catch(setError)
-      .finally(() => setLoading(false));
-  }, []);
-  
-  if (loading) return <Loading />;
-  if (error) return <Error error={error} />;
-  
-  return <div>{data}</div>;
-}
-
-// ✅ 关注点分离
-function NewComponent() {
-  const data = fetchData();
-  return <div>{data}</div>;
-}
-
-function App() {
-  return (
-    <ErrorBoundary>
-      <Suspense fallback={<Loading />}>
-        <NewComponent />
-      </Suspense>
-    </ErrorBoundary>
-  );
-}
-```
-
-### Suspense 的最佳实践
-
-**1. 合理的 fallback**
-
-```javascript
-// ❌ 太简单的 fallback
-<Suspense fallback={<div>Loading...</div>}>
-  <Component />
-</Suspense>
-
-// ✅ 提供有意义的反馈
-<Suspense fallback={
-  <div className="loading-container">
-    <Spinner />
-    <p>Loading your data...</p>
-  </div>
-}>
-  <Component />
-</Suspense>
-
-// ✅ 骨架屏
-<Suspense fallback={
-  <div className="skeleton">
-    <div className="skeleton-header" />
-    <div className="skeleton-body" />
-  </div>
-}>
-  <Component />
-</Suspense>
-```
-
-**2. 错误处理**
-
-```javascript
-// 总是配合 ErrorBoundary 使用
-<ErrorBoundary fallback={<ErrorFallback />}>
-  <Suspense fallback={<LoadingFallback />}>
-    <AsyncComponent />
-  </Suspense>
-</ErrorBoundary>
-```
-
-**3. 性能考虑**
-
-```javascript
-// 避免过深的嵌套 Suspense
-<Suspense fallback={<div>Loading outer...</div>}>
-  <Outer>
-    <Suspense fallback={<div>Loading inner...</div>}>
-      <Inner />
-    </Suspense>
-  </Outer>
-</Suspense>
-
-// 考虑合并或调整结构
-```
-
-### Suspense 的限制
-
-```javascript
-// 1. 不能在事件处理函数中使用 Suspense
-function handleClick() {
-  // ❌ 事件处理中的 Suspense 不工作
-  const data = fetchData();
-  console.log(data);
-}
-
-// 2. 需要特殊的数据获取库
-// 原生 fetch 需要包装才能与 Suspense 配合
-// 推荐使用 React Query、SWR、Relay 等
-
-// 3. 服务端渲染需要特殊处理
-// 需要等待所有数据获取完成才能发送 HTML
-```
-
-### 总结
-
-**Suspense 的核心价值：**
-
-1. **声明式异步处理** - 更简洁的代码
-2. **避免 Waterfall** - 并行数据获取
-3. **更好的用户体验** - 流式渲染、渐进加载
-4. **关注点分离** - UI 和数据逻辑分离
-
-**适用场景：**
-
-- 代码分割和懒加载
-- 数据获取（配合 React Query 等）
-- 流式渲染
-- 复杂的异步 UI
-
-**最佳实践：**
-
-- 配合 ErrorBoundary 使用
-- 提供有意义的 fallback
-- 合理使用 SuspenseList
-- 避免过深的嵌套
-- 考虑使用成熟的数据获取库
-
----
-
-## 22、React中如何实现组件通信？有哪些方式？
-
-### 1. 父子组件通信（Props）
-
-**父传子：**
-
-```javascript
-// 父组件
-function Parent() {
-  const message = "Hello from parent";
-  const count = 42;
-  
-  return (
-    <Child message={message} count={count} />
-  );
-}
-
-// 子组件
-function Child({ message, count }) {
-  return (
-    <div>
-      <p>{message}</p>
-      <p>Count: {count}</p>
-    </div>
-  );
-}
-```
-
-**子传父（回调函数）：**
-
-```javascript
-// 父组件
-function Parent() {
-  const [count, setCount] = useState(0);
-  
-  const handleIncrement = (amount) => {
-    setCount(prev => prev + amount);
-  };
-  
-  return (
-    <div>
-      <p>Count: {count}</p>
-      <Child onIncrement={handleIncrement} />
-    </div>
-  );
-}
-
-// 子组件
-function Child({ onIncrement }) {
-  return (
-    <div>
-      <button onClick={() => onIncrement(1)}>+1</button>
-      <button onClick={() => onIncrement(5)}>+5</button>
-    </div>
-  );
-}
-```
-
-**双向绑定（受控组件）：**
-
-```javascript
-function Parent() {
-  const [value, setValue] = useState('');
-  
-  const handleChange = (newValue) => {
-    setValue(newValue);
-  };
-  
-  return (
-    <div>
-      <Child value={value} onChange={handleChange} />
-      <p>You typed: {value}</p>
-    </div>
-  );
-}
-
-function Child({ value, onChange }) {
-  return (
-    <input 
-      type="text" 
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-    />
-  );
-}
-```
-
-### 2. Context API（跨层级通信）
-
-**基本用法：**
-
-```javascript
-// 创建 Context
-const ThemeContext = createContext();
-
-// Provider 组件
-function ThemeProvider({ children }) {
-  const [theme, setTheme] = useState('light');
-  
-  const toggleTheme = () => {
-    setTheme(prev => prev === 'light' ? 'dark' : 'light');
-  };
-  
-  return (
-    <ThemeContext.Provider value={{ theme, toggleTheme }}>
-      {children}
-    </ThemeContext.Provider>
-  );
-}
-
-// 消费 Context
-function ThemedButton() {
-  const { theme, toggleTheme } = useContext(ThemeContext);
-  
-  return (
-    <button 
-      style={{ 
-        background: theme === 'dark' ? '#333' : '#fff',
-        color: theme === 'dark' ? '#fff' : '#333'
-      }}
-      onClick={toggleTheme}
-    >
-      Toggle Theme
-    </button>
-  );
-}
-
-// 使用
-function App() {
-  return (
-    <ThemeProvider>
-      <ThemedButton />
-    </ThemeProvider>
-  );
-}
-```
-
-**多个 Context：**
-
-```javascript
-const UserContext = createContext();
-const ThemeContext = createContext();
-
-function App() {
-  const [user, setUser] = useState(null);
-  const [theme, setTheme] = useState('light');
-  
-  return (
-    <UserContext.Provider value={{ user, setUser }}>
-      <ThemeContext.Provider value={{ theme, setTheme }}>
-        <Component />
-      </ThemeContext.Provider>
-    </UserContext.Provider>
-  );
-}
-
-function Component() {
-  const { user } = useContext(UserContext);
-  const { theme } = useContext(ThemeContext);
-  
-  return <div>User: {user?.name}, Theme: {theme}</div>;
-}
-```
-
-### 3. Ref 通信
-
-**forwardRef：**
-
-```javascript
-import { forwardRef, useRef, useImperativeHandle } from 'react';
-
-const ChildComponent = forwardRef((props, ref) => {
-  const inputRef = useRef();
-  
-  // 暴露方法给父组件
-  useImperativeHandle(ref, () => ({
-    focus: () => {
-      inputRef.current?.focus();
-    },
-    getValue: () => {
-      return inputRef.current?.value;
-    },
-    clear: () => {
-      inputRef.current.value = '';
-    }
-  }));
-  
-  return (
-    <input 
-      ref={inputRef}
-      type="text"
-      placeholder="Child component input"
-    />
-  );
-});
-
-// 使用
-function ParentComponent() {
-  const childRef = useRef();
-  
-  const handleFocus = () => {
-    childRef.current?.focus();
-  };
-  
-  const handleGetValue = () => {
-    const value = childRef.current?.getValue();
-    console.log('Value:', value);
-  };
-  
-  return (
-    <div>
-      <ChildComponent ref={childRef} />
-      <button onClick={handleFocus}>Focus Child Input</button>
-      <button onClick={handleGetValue}>Get Value</button>
-    </div>
-  );
-}
-```
-
-### 4. 状态管理库
-
-**Redux Toolkit：**
-
-```javascript
-import { configureStore, createSlice } from '@reduxjs/toolkit';
-import { Provider, useDispatch, useSelector } from 'react-redux';
-
-// 创建 slice
-const counterSlice = createSlice({
-  name: 'counter',
-  initialState: { value: 0 },
-  reducers: {
-    increment: (state) => {
-      state.value += 1;
-    },
-    decrement: (state) => {
-      state.value -= 1;
-    },
-  },
-});
-
-// 创建 store
-const store = configureStore({
-  reducer: {
-    counter: counterSlice.reducer,
-  },
-});
-
-// 组件中使用
-function Counter() {
-  const count = useSelector((state) => state.counter.value);
-  const dispatch = useDispatch();
-  
-  return (
-    <div>
-      <span>{count}</span>
-      <button onClick={() => dispatch(counterSlice.actions.increment())}>
-        +
-      </button>
-      <button onClick={() => dispatch(counterSlice.actions.decrement())}>
-        -
-      </button>
-    </div>
-  );
-}
-
-// 包装应用
-function App() {
-  return (
-    <Provider store={store}>
-      <Counter />
-    </Provider>
-  );
-}
-```
-
-**Zustand：**
-
-```javascript
-import create from 'zustand';
-
-// 创建 store
-const useStore = create((set) => ({
-  count: 0,
-  increment: () => set((state) => ({ count: state.count + 1 })),
-  decrement: () => set((state) => ({ count: state.count - 1 })),
-  reset: () => set({ count: 0 }),
-}));
-
-// 使用
-function Counter() {
-  const { count, increment, decrement, reset } = useStore();
-  
-  return (
-    <div>
-      <span>{count}</span>
-      <button onClick={increment}>+</button>
-      <button onClick={decrement}>-</button>
-      <button onClick={reset}>Reset</button>
-    </div>
-  );
-}
-```
-
-### 5. 自定义事件（Event Bus）
-
-```javascript
-// 创建简单的 EventEmitter
-class EventEmitter {
-  constructor() {
-    this.events = {};
-  }
-  
-  on(event, listener) {
-    if (!this.events[event]) {
-      this.events[event] = [];
-    }
-    this.events[event].push(listener);
-  }
-  
-  off(event, listener) {
-    if (!this.events[event]) return;
-    this.events[event] = this.events[event].filter(l => l !== listener);
-  }
-  
-  emit(event, data) {
-    if (!this.events[event]) return;
-    this.events[event].forEach(listener => listener(data));
-  }
-}
-
-const eventBus = new EventEmitter();
-
-// 组件 A - 发送事件
-function ComponentA() {
-  const handleClick = () => {
-    eventBus.emit('user-action', { type: 'click', timestamp: Date.now() });
-  };
-  
-  return <button onClick={handleClick}>Trigger Event</button>;
-}
-
-// 组件 B - 监听事件
-function ComponentB() {
-  const [events, setEvents] = useState([]);
-  
-  useEffect(() => {
-    const handleUserAction = (data) => {
-      setEvents(prev => [...prev, data]);
-    };
-    
-    eventBus.on('user-action', handleUserAction);
-    
-    return () => {
-      eventBus.off('user-action', handleUserAction);
-    };
-  }, []);
-  
-  return (
-    <div>
-      <h3>Event Log:</h3>
-      <ul>
-        {events.map((event, index) => (
-          <li key={index}>
-            {event.type} at {new Date(event.timestamp).toLocaleTimeString()}
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-function App() {
-  return (
-    <div>
-      <ComponentA />
-      <ComponentB />
-    </div>
-  );
-}
-```
-
-### 6. Portal 通信
-
-```javascript
-import { createPortal } from 'react-dom';
-
-// Modal 组件
-function Modal({ isOpen, onClose, children }) {
-  if (!isOpen) return null;
-  
-  return createPortal(
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-        {children}
-        <button onClick={onClose}>Close</button>
-      </div>
-    </div>,
-    document.body
-  );
-}
-
-// 使用
-function App() {
-  const [isModalOpen, setIsModalOpen] = useState(false);
-  const [modalData, setModalData] = useState(null);
-  
-  const openModal = (data) => {
-    setModalData(data);
-    setIsModalOpen(true);
-  };
-  
-  const closeModal = () => {
-    setIsModalOpen(false);
-    setModalData(null);
-  };
-  
-  return (
-    <div>
-      <button onClick={() => openModal({ message: 'Hello' })}>
-        Open Modal
-      </button>
-      
-      <Modal isOpen={isModalOpen} onClose={closeModal}>
-        {modalData && <p>{modalData.message}</p>}
-      </Modal>
-    </div>
-  );
-}
-```
-
-### 7. URL 参数
-
-```javascript
-import { useSearchParams, useLocation } from 'react-router-dom';
-
-// 设置 URL 参数
-function SetParamsComponent() {
-  const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
-  
-  const setQuery = (key, value) => {
-    searchParams.set(key, value);
-    navigate({ search: searchParams.toString() });
-  };
-  
-  return (
-    <div>
-      <input 
-        onChange={(e) => setQuery('q', e.target.value)}
-        placeholder="Search..."
-      />
-      <input 
-        onChange={(e) => setQuery('page', e.target.value)}
-        placeholder="Page..."
-      />
-    </div>
-  );
-}
-
-// 读取 URL 参数
-function GetParamsComponent() {
-  const [searchParams] = useSearchParams();
-  
-  const query = searchParams.get('q') || '';
-  const page = searchParams.get('page') || '1';
-  
-  return (
-    <div>
-      <p>Query: {query}</p>
-      <p>Page: {page}</p>
-    </div>
-  );
-}
-
-// 监听 URL 变化
-function WatchParamsComponent() {
-  const location = useLocation();
-  
-  useEffect(() => {
-    console.log('URL changed:', location.search);
-  }, [location]);
-  
-  return <div>Current URL: {location.search}</div>;
-}
-```
-
-### 8. 通信方式对比
-
-| 方式 | 适用场景 | 优点 | 缺点 |
-|------|---------|------|------|
-| **Props** | 父子组件 | 简单直接 | 层级深时繁琐（prop drilling） |
-| **Context** | 跨层级 | 避免层级传递 | 可能导致不必要的重渲染 |
-| **Redux/Zustand** | 复杂状态 | 集中管理，易调试 | 学习曲线，增加复杂度 |
-| **Ref** | 访问子组件方法 | 直接操作 | 破坏组件封装性 |
-| **Event Bus** | 解耦组件 | 松耦合 | 难以追踪事件流 |
-| **URL** | 可分享状态 | 可直接链接 | 参数有限，不够灵活 |
-| **Portal** | 跨层级渲染 | 避免样式冲突 | 事件冒泡需要注意 |
-
-### 通信方式选择指南
-
-```
-场景选择：
-├── 父子组件通信
-│   ├── 简单数据 → Props
-│   └── 子组件需要调用父方法 → 回调函数
-├── 跨层级通信
-│   ├── 状态共享 → Context / Zustand
-│   └── 复杂应用 → Redux Toolkit
-├── 不相关组件通信
-│   ├── 松耦合需求 → Event Bus
-│   └── 需要持久化 → URL / LocalStorage
-├── 访问子组件方法
-│   └── 直接操作 → Ref
-└── 特殊渲染需求
-    └── DOM 层级独立 → Portal
-```
-
-### 最佳实践
-
-```javascript
-// 1. 优先使用 Props 和 Context
-// Props 用于直接父子关系
-// Context 用于跨层级共享
-
-// 2. 复杂应用使用状态管理库
-// 大型应用 → Redux Toolkit
-// 中型应用 → Zustand / Jotai
-
-// 3. 避免过度设计
-// 简单场景不需要引入 Redux
-// Props 和 Context 足够应对大多数情况
-
-// 4. 保持组件的单一职责
-// 组件只负责自己的渲染
-// 数据逻辑通过 hooks 抽离
-
-// 5. 使用 TypeScript 增强类型安全
-// 明确定义 props 和 context 的类型
-```
-
----
-
-## 23、React中如何做错误处理？错误边界的使用场景？
-
-### React 错误处理机制
-
-**错误边界（Error Boundary）** 是 React 组件，可以捕获其子组件树中任何位置的 JavaScript 错误，记录这些错误，并显示备用 UI。
-
-### 错误边界的基本用法
-
-```javascript
-class ErrorBoundary extends React.Component {
-  constructor(props) {
-    super(props);
-    this.state = { hasError: false, error: null, errorInfo: null };
-  }
-
-  // 捕获子组件抛出的错误
-  static getDerivedStateFromError(error) {
-    // 更新 state 使下一次渲染能够显示降级后的 UI
-    return { hasError: true };
-  }
-
-  // 记录错误信息
-  componentDidCatch(error, errorInfo) {
-    // 可以将错误日志上报给服务器
-    console.error('ErrorBoundary caught an error:', error, errorInfo);
-    logErrorToService(error, errorInfo);
-    
-    this.setState({
-      error,
-      errorInfo,
-    });
-  }
-
-  render() {
-    if (this.state.hasError) {
-      // 自定义降级 UI
-      return this.props.fallback || (
-        <div className="error-fallback">
-          <h1>Something went wrong.</h1>
-          <details>
-            <summary>Error Details</summary>
-            <pre>{this.state.error?.toString()}</pre>
-            <pre>{this.state.errorInfo?.componentStack}</pre>
-          </details>
-          <button onClick={() => window.location.reload()}>
-            Reload Page
-          </button>
-        </div>
-      );
-    }
-
-    return this.props.children;
-  }
-}
-
-// 使用
-function App() {
-  return (
-    <ErrorBoundary>
-      <MyComponent />
-    </ErrorBoundary>
-  );
-}
-```
-
-### 函数组件的错误边界
-
-```javascript
-import { ComponentType, ReactNode } from 'react';
-
-interface ErrorBoundaryProps {
-  children: ReactNode;
-  fallback?: ReactNode;
-  onError?: (error: Error, errorInfo: React.ErrorInfo) => void;
-}
-
-interface ErrorBoundaryState {
-  hasError: boolean;
-  error?: Error;
-}
-
-// 函数组件风格的错误边界包装器
-function withErrorBoundary<P extends object>(
-  Component: ComponentType<P>,
-  fallback?: ReactNode,
-  onError?: (error: Error, errorInfo: React.ErrorInfo) => void
-) {
-  return class ErrorBoundary extends React.Component<ErrorBoundaryProps & P, ErrorBoundaryState> {
-    constructor(props: ErrorBoundaryProps & P) {
-      super(props);
-      this.state = { hasError: false };
-    }
-
-    static getDerivedStateFromError(error: Error) {
-      return { hasError: true, error };
-    }
-
-    componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
-      if (onError) {
-        onError(error, errorInfo);
-      } else {
-        console.error('Error:', error, errorInfo);
-      }
-    }
-
-    render() {
-      if (this.state.hasError) {
-        return fallback || <div>Something went wrong</div>;
-      }
-
-      const { fallback: _, onError: __, ...props } = this.props;
-      return <Component {...(props as P)} />;
-    }
-  };
-}
-
-// 使用
-const SafeComponent = withErrorBoundary(
-  MyComponent,
-  <div>Error occurred</div>,
-  (error, errorInfo) => {
-    logError(error, errorInfo);
-  }
-);
-```
-
-### 错误边界的使用场景
-
-**1. 组件级别的错误边界**
-
-```javascript
-function App() {
-  return (
-    <div>
-      <Header />
-      
-      <ErrorBoundary fallback={<div>Dashboard unavailable</div>}>
-        <Dashboard />
-      </ErrorBoundary>
-      
-      <ErrorBoundary fallback={<div>Sidebar unavailable</div>}>
-        <Sidebar />
-      </ErrorBoundary>
-      
-      <Footer />
-    </div>
-  );
-}
-
-// 每个关键部分都有自己的错误边界
-// 一个组件出错不会影响整个应用
-```
-
-**2. 路由级别的错误边界**
-
-```javascript
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
-
-function App() {
-  return (
-    <BrowserRouter>
-      <Routes>
-        <Route
-          path="/"
-          element={
-            <ErrorBoundary fallback={<div>Home error</div>}>
-              <HomePage />
-            </ErrorBoundary>
-          }
-        />
-        <Route
-          path="/dashboard"
-          element={
-            <ErrorBoundary fallback={<div>Dashboard error</div>}>
-              <DashboardPage />
-            </ErrorBoundary>
-          }
-        />
-        <Route
-          path="/settings"
-          element={
-            <ErrorBoundary fallback={<div>Settings error</div>}>
-              <SettingsPage />
-            </ErrorBoundary>
-          }
-        />
-      </Routes>
-    </BrowserRouter>
-  );
-}
-
-// 每个路由独立的错误处理
-```
-
-**3. 第三方组件的错误边界**
-
-```javascript
-function App() {
-  return (
-    <div>
-      <ErrorBoundary fallback={<div>Chart failed to load</div>}>
-        <ThirdPartyChart data={chartData} />
-      </ErrorBoundary>
-      
-      <ErrorBoundary fallback={<div>Map failed to load</div>}>
-        <ThirdPartyMap location={location} />
-      </ErrorBoundary>
-    </div>
-  );
-}
-
-// 保护不受信任的第三方组件
-```
-
-### 错误边界捕获的限制
-
-**错误边界无法捕获：**
-
-```javascript
-// 1. 事件处理器中的错误
-function handleClick() {
-  try {
-    // ❌ Error Boundary 无法捕获
-    throw new Error('Handler error');
-  } catch (error) {
-    console.error(error);
-  }
-}
-
-// 2. 异步代码中的错误
-function Component() {
-  useEffect(() => {
-    // ❌ Error Boundary 无法捕获
-    fetchData().catch(error => {
-      console.error('Async error:', error);
-    });
-  }, []);
-}
-
-// 3. 服务端渲染的错误
-// SSR 的错误需要在服务端处理
-
-// 4. 错误边界本身的错误
-```
-
-### 错误上报
-
-```javascript
-class ErrorBoundary extends React.Component {
-  componentDidCatch(error, errorInfo) {
-    const errorData = {
-      message: error.message,
-      stack: error.stack,
-      componentStack: errorInfo.componentStack,
-      timestamp: new Date().toISOString(),
-      userAgent: navigator.userAgent,
-      url: window.location.href,
-    };
-    
-    // 上报到错误监控服务
-    this.reportError(errorData);
-  }
-  
-  async reportError(errorData) {
-    try {
-      // 上报到 Sentry
-      Sentry.captureException(errorData);
-      
-      // 或上报到自己的服务器
-      await fetch('/api/errors', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(errorData),
-      });
-      
-      // 或上报到其他服务（Bugsnag, LogRocket 等）
-    } catch (e) {
-      console.error('Failed to report error:', e);
-    }
-  }
-}
-```
-
-### 全局错误处理
-
-```javascript
-// 1. 未捕获的 Promise rejection
-window.addEventListener('unhandledrejection', (event) => {
-  console.error('Unhandled promise rejection:', event.reason);
-  
-  // 上报错误
-  reportError({
-    type: 'unhandledrejection',
-    reason: event.reason,
-  });
-});
-
-// 2. 全局 JavaScript 错误
-window.addEventListener('error', (event) => {
-  console.error('Global error:', event.error);
-  
-  // 上报错误
-  reportError({
-    type: 'error',
-    message: event.message,
-    filename: event.filename,
-    lineno: event.lineno,
-    colno: event.colno,
-    error: event.error,
-  });
-});
-
-// 3. React 错误边界
-<ErrorBoundary
-  onError={(error, errorInfo) => {
-    reportError({
-      type: 'react-error',
-      error,
-      componentStack: errorInfo.componentStack,
-    });
-  }}
->
-  <App />
-</ErrorBoundary>
-```
-
-### 恢复策略
-
-```javascript
-class ErrorBoundary extends React.Component {
-  state = { hasError: false, error: null };
-
-  static getDerivedStateFromError(error) {
-    return { hasError: true, error };
-  }
-
-  componentDidCatch(error, errorInfo) {
-    logError(error, errorInfo);
-  }
-
-  handleReset = () => {
-    this.setState({ hasError: false, error: null });
-  };
-
-  render() {
-    if (this.state.hasError) {
-      return (
-        <div className="error-boundary">
-          <h2>Something went wrong</h2>
-          <p>{this.state.error?.message}</p>
-          
-          <div className="error-actions">
-            <button onClick={this.handleReset}>
-              Try Again
-            </button>
-            <button onClick={() => window.location.reload()}>
-              Reload Page
-            </button>
-            <button onClick={() => window.history.back()}>
-              Go Back
-            </button>
-          </div>
-        </div>
-      );
-    }
-
-    return this.props.children;
-  }
-}
-```
-
-### 测试错误边界
-
-```javascript
-import { render, screen } from '@testing-library/react';
-
-// 测试错误边界
-it('renders fallback UI when child throws error', () => {
-  const ThrowError = () => {
-    throw new Error('Test error');
-  };
-  
-  render(
-    <ErrorBoundary fallback={<div>Error fallback</div>}>
-      <ThrowError />
-    </ErrorBoundary>
-  );
-  
-  expect(screen.getByText('Error fallback')).toBeInTheDocument();
-});
-
-it('renders children when no error occurs', () => {
-  render(
-    <ErrorBoundary fallback={<div>Error fallback</div>}>
-      <div>Normal content</div>
-    </ErrorBoundary>
-  );
-  
-  expect(screen.getByText('Normal content')).toBeInTheDocument();
-});
-```
-
-### 错误边界最佳实践
-
-```javascript
-// 1. 分层错误边界
-// 顶层错误边界 - 整个应用的最后防线
-// 模块级错误边界 - 保护关键功能模块
-// 组件级错误边界 - 保护不稳定的第三方组件
-
-function App() {
-  return (
-    <GlobalErrorBoundary>
-      <AppLayout />
-    </GlobalErrorBoundary>
-  );
-}
-
-function AppLayout() {
-  return (
-    <div>
-      <Header />
-      <main>
-        <ModuleErrorBoundary>
-          <Dashboard />
-        </ModuleErrorBoundary>
-        <ModuleErrorBoundary>
-          <Sidebar />
-        </ModuleErrorBoundary>
-      </main>
-      <Footer />
-    </div>
-  );
-}
-
-// 2. 友好的错误 UI
-// 提供清晰的错误信息
-// 提供恢复选项
-// 保持品牌一致性
-
-// 3. 错误上报
-// 记录详细的错误信息
-// 包括用户上下文
-// 实时监控和告警
-
-// 4. 测试
-// 测试错误边界是否正确捕获错误
-// 测试 fallback UI 是否正确显示
-// 测试恢复功能是否正常
-```
-
-### 总结
-
-**错误边界的核心价值：**
-
-1. **防止白屏** - 显示友好的错误 UI
-2. **错误隔离** - 一个组件出错不影响整个应用
-3. **错误上报** - 集中处理和上报错误
-4. **用户体验** - 提供恢复选项
-
-**使用场景：**
-
-- 第三方组件
-- 复杂的业务模块
-- 不稳定的网络请求
-- 关键功能的保护
-
-**限制：**
-
-- 不能捕获事件处理器中的错误
-- 不能捕获异步代码中的错误
-- 不能用于函数组件（只能类组件）
-- SSR 中需要特殊处理
-
----
-
-## 24、React中如何实现动画？有哪些库可以使用？
-
-### CSS 动画
-
-**1. CSS Transitions**
-
-```javascript
-import './App.css';
-
-// App.css
-.fade-in {
-  animation: fadeIn 0.3s ease-in;
-}
-
-@keyframes fadeIn {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
-// 组件使用
-function FadeInComponent() {
-  const [visible, setVisible] = useState(true);
-  
-  return (
-    <div>
-      {visible && <div className="fade-in">Hello World</div>}
-      <button onClick={() => setVisible(!visible)}>
-        Toggle
-      </button>
-    </div>
-  );
-}
-```
-
-**2. 条件类名**
-
-```javascript
-function AnimatedComponent() {
-  const [isActive, setIsActive] = useState(false);
-  
-  return (
-    <div
-      className={`box ${isActive ? 'active' : ''}`}
-      onClick={() => setIsActive(!isActive)}
-    >
-      Click me
-    </div>
-  );
-}
-
-// CSS
-.box {
-  transition: all 0.3s ease;
-  background-color: blue;
-}
-
-.box.active {
-  background-color: red;
-  transform: scale(1.1);
-}
-```
-
-### Framer Motion
-
-**基础动画：**
-
-```javascript
-import { motion } from 'framer-motion';
-
-function BasicAnimation() {
-  const [isOpen, setIsOpen] = useState(false);
-  
-  return (
-    <div>
-      <motion.button
-        whileHover={{ scale: 1.1 }}
-        whileTap={{ scale: 0.9 }}
-        onClick={() => setIsOpen(!isOpen)}
-      >
-        Click me
-      </motion.button>
-      
-      {isOpen && (
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: -20 }}
-          transition={{ duration: 0.3 }}
-        >
-          Hello World
-        </motion.div>
-      )}
-    </div>
-  );
-}
-```
-
-**AnimatePresence（动画进入/离开）：**
-
-```javascript
-import { motion, AnimatePresence } from 'framer-motion';
-
-function Modal({ isOpen, onClose }) {
-  return (
-    <AnimatePresence>
-      {isOpen && (
-        <>
-          <motion.div
-            className="overlay"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            onClick={onClose}
-          />
-          
-          <motion.div
-            className="modal"
-            initial={{ opacity: 0, scale: 0.8 }}
-            animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.8 }}
-            transition={{ type: 'spring', damping: 25, stiffness: 300 }}
-          >
-            <h2>Modal Title</h2>
-            <p>Modal content</p>
-            <button onClick={onClose}>Close</button>
-          </motion.div>
-        </>
-      )}
-    </AnimatePresence>
-  );
-}
-```
-
-**列表动画：**
-
-```javascript
-import { motion, AnimatePresence } from 'framer-motion';
-
-function TodoList({ items, onDelete }) {
-  return (
-    <motion.ul layout>
-      <AnimatePresence>
-        {items.map(item => (
-          <motion.li
-            key={item.id}
-            layout
-            initial={{ opacity: 0, x: -20 }}
-            animate={{ opacity: 1, x: 0 }}
-            exit={{ opacity: 0, x: 20 }}
-            transition={{ duration: 0.3 }}
-          >
-            {item.text}
-            <button onClick={() => onDelete(item.id)}>Delete</button>
-          </motion.li>
-        ))}
-      </AnimatePresence>
-    </motion.ul>
-  );
-}
-```
-
-**手势动画：**
-
-```javascript
-import { motion, useMotionValue, useTransform } from 'framer-motion';
-
-function DraggableCard() {
-  const x = useMotionValue(0);
-  const opacity = useTransform(x, [-200, 0, 200], [0, 1, 0]);
-  
-  return (
-    <motion.div
-      style={{ x, opacity }}
-      drag="x"
-      dragConstraints={{ left: -200, right: 200 }}
-      whileHover={{ scale: 1.05 }}
-      whileTap={{ scale: 0.95 }}
-    >
-      <h3>Drag me</h3>
-    </motion.div>
-  );
-}
-```
-
-### React Spring
-
-**基础动画：**
-
-```javascript
-import { useSpring, animated } from '@react-spring/web';
-
-function AnimatedComponent() {
-  const [isToggled, setToggle] = useState(false);
-  
-  const styles = useSpring({
-    opacity: isToggled ? 1 : 0,
-    transform: isToggled ? 'scale(1)' : 'scale(0.5)',
-    config: { tension: 300, friction: 10 }
-  });
-  
-  return (
-    <div>
-      <animated.div style={styles}>
-        Hello World
-      </animated.div>
-      <button onClick={() => setToggle(!isToggled)}>
-        Toggle
-      </button>
-    </div>
-  );
-}
-```
-
-**链式动画：**
-
-```javascript
-import { useSpring, animated, useChain, useSpringRef } from '@react-spring/web';
-
-function ChainAnimation() {
-  const spring1Ref = useSpringRef();
-  const spring2Ref = useSpringRef();
-  
-  const spring1 = useSpring({
-    ref: spring1Ref,
-    from: { opacity: 0, transform: 'translateY(-20px)' },
-    to: { opacity: 1, transform: 'translateY(0px)' },
-  });
-  
-  const spring2 = useSpring({
-    ref: spring2Ref,
-    from: { opacity: 0, transform: 'translateY(20px)' },
-    to: { opacity: 1, transform: 'translateY(0px)' },
-  });
-  
-  // 链式执行：spring1 → spring2
-  useChain([spring1Ref, spring2Ref]);
-  
-  return (
-    <div>
-      <animated.div style={spring1}>First</animated.div>
-      <animated.div style={spring2}>Second</animated.div>
-    </div>
-  );
-}
-```
-
-### React Transition Group
-
-**基础过渡：**
-
-```javascript
-import { CSSTransition, TransitionGroup } from 'react-transition-group';
-import './App.css';
-
-function AnimatedList({ items }) {
-  return (
-    <TransitionGroup>
-      {items.map(item => (
-        <CSSTransition
-          key={item.id}
-          timeout={300}
-          classNames="item"
-          unmountOnExit
-        >
-          <div className="item">{item.text}</div>
-        </CSSTransition>
-      ))}
-    </TransitionGroup>
-  );
-}
-
-// App.css
-.item-enter {
-  opacity: 0;
-  transform: translateX(-20px);
-}
-
-.item-enter-active {
-  opacity: 1;
-  transform: translateX(0);
-  transition: all 300ms;
-}
-
-.item-exit {
-  opacity: 1;
-  transform: translateX(0);
-}
-
-.item-exit-active {
-  opacity: 0;
-  transform: translateX(20px);
-  transition: all 300ms;
-}
-```
-
-### 动画库对比
-
-| 库 | 特点 | 适用场景 | Bundle Size |
-|-----|------|---------|-------------|
-| **Framer Motion** | API 简单，功能强大 | 复杂动画、手势交互 | ~40KB |
-| **React Spring** | 物理动画，性能好 | 流畅的过渡动画 | ~25KB |
-| **React Transition Group** | 轻量级，CSS 动画 | 简单的进入/离开动画 | ~5KB |
-| **React Motion** | 函数式动画 | 可预测的动画 | ~16KB |
-| **GSAP** | 强大的时间轴 | 复杂的序列动画 | ~60KB |
-
-### 最佳实践
-
-```javascript
-// 1. 使用 requestAnimationFrame
-function smoothAnimation() {
-  let startTime = null;
-  
-  function animate(currentTime) {
-    if (!startTime) startTime = currentTime;
-    const progress = (currentTime - startTime) / duration;
-    
-    if (progress < 1) {
-      const value = ease(progress);
-      updateElement(value);
-      requestAnimationFrame(animate);
-    }
-  }
-  
-  requestAnimationFrame(animate);
-}
-
-// 2. 使用 CSS transform 和 opacity
-// 这两个属性不会触发重排，性能最好
-function PerformanceOptimized() {
-  return (
-    <div
-      style={{
-        transform: 'translateX(100px)',
-        opacity: 0.5,
-        // 避免：left, top, width, height
-      }}
-    />
-  );
-}
-
-// 3. 使用 will-change 提示浏览器
-.high-performance-element {
-  will-change: transform, opacity;
-}
-
-// 4. 减少动画元素数量
-// 只对可见元素应用动画
-// 使用虚拟化处理长列表
-```
-
-### 总结
-
-**选择建议：**
-
-- **简单动画** - CSS Transitions/Animations
-- **复杂动画** - Framer Motion
-- **物理效果** - React Spring
-- **轻量级** - React Transition Group
-- **时间轴控制** - GSAP
-
-**性能优化：**
-
-- 使用 transform 和 opacity
-- 避免同时动画多个元素
-- 使用 requestAnimationFrame
-- 减少重排和重绘
-- 使用硬件加速
-
----
-
-## 25、React中如何实现表单处理？受控组件和非受控组件的区别？
-
-### 受控组件
-
-**基本用法：**
-
-```javascript
-function ControlledForm() {
-  const [formData, setFormData] = useState({
-    username: '',
-    email: '',
-    password: '',
-  });
-  
-  const handleChange = (e) => {
-    const { name, value } = e.target;
-    setFormData(prev => ({
-      ...prev,
-      [name]: value
-    }));
-  };
-  
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    console.log('Form submitted:', formData);
-    // 发送数据到服务器
-    submitForm(formData);
-  };
-  
-  return (
-    <form onSubmit={handleSubmit}>
-      <div>
-        <label>Username:</label>
-        <input
-          type="text"
-          name="username"
-          value={formData.username}
-          onChange={handleChange}
-        />
-      </div>
-      
-      <div>
-        <label>Email:</label>
-        <input
-          type="email"
-          name="email"
-          value={formData.email}
-          onChange={handleChange}
-        />
-      </div>
-      
-      <div>
-        <label>Password:</label>
-        <input
-          type="password"
-          name="password"
-          value={formData.password}
-          onChange={handleChange}
-        />
-      </div>
-      
-      <button type="submit">Submit</button>
-    </form>
-  );
-}
-```
-
-**表单验证：**
-
-```javascript
-function ValidatedForm() {
-  const [formData, setFormData] = useState({
-    email: '',
-    password: '',
-  });
-  
-  const [errors, setErrors] = useState({});
-  const [touched, setTouched] = useState({});
-  
-  const validate = (values) => {
-    const errors = {};
-    
-    if (!values.email) {
-      errors.email = 'Email is required';
-    } else if (!/\S+@\S+\.\S+/.test(values.email)) {
-      errors.email = 'Email is invalid';
-    }
-    
-    if (!values.password) {
-      errors.password = 'Password is required';
-    } else if (values.password.length < 6) {
-      errors.password = 'Password must be at least 6 characters';
-    }
-    
-    return errors;
-  };
-  
-  const handleChange = (e) => {
-    const { name, value } = e.target;
-    setFormData(prev => ({ ...prev, [name]: value }));
-    
-    // 实时验证
-    const newErrors = validate({ ...formData, [name]: value });
-    setErrors(newErrors);
-  };
-  
-  const handleBlur = (e) => {
-    const { name } = e.target;
-    setTouched(prev => ({ ...prev, [name]: true }));
-  };
-  
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    
-    // 标记所有字段为已触碰
-    const newTouched = {};
-    Object.keys(formData).forEach(key => {
-      newTouched[key] = true;
-    });
-    setTouched(newTouched);
-    
-    // 验证所有字段
-    const validationErrors = validate(formData);
-    setErrors(validationErrors);
-    
-    // 如果没有错误，提交表单
-    if (Object.keys(validationErrors).length === 0) {
-      submitForm(formData);
-    }
-  };
-  
-  return (
-    <form onSubmit={handleSubmit}>
-      <div>
-        <label>Email:</label>
-        <input
-          type="email"
-          name="email"
-          value={formData.email}
-          onChange={handleChange}
-          onBlur={handleBlur}
-        />
-        {touched.email && errors.email && (
-          <span className="error">{errors.email}</span>
-        )}
-      </div>
-      
-      <div>
-        <label>Password:</label>
-        <input
-          type="password"
-          name="password"
-          value={formData.password}
-          onChange={handleChange}
-          onBlur={handleBlur}
-        />
-        {touched.password && errors.password && (
-          <span className="error">{errors.password}</span>
-        )}
-      </div>
-      
-      <button type="submit">Submit</button>
-    </form>
-  );
-}
-```
-
-**使用自定义 Hook：**
-
-```javascript
-function useForm(initialValues, validate) {
-  const [values, setValues] = useState(initialValues);
-  const [errors, setErrors] = useState({});
-  const [touched, setTouched] = useState({});
-  
-  const handleChange = (e) => {
-    const { name, value } = e.target;
-    setValues(prev => ({ ...prev, [name]: value }));
-    
-    if (touched[name]) {
-      const validationErrors = validate({ ...values, [name]: value });
-      setErrors(prev => ({ ...prev, [name]: validationErrors[name] }));
-    }
-  };
-  
-  const handleBlur = (e) => {
-    const { name } = e.target;
-    setTouched(prev => ({ ...prev, [name]: true }));
-  };
-  
-  const handleSubmit = (callback) => (e) => {
-    e.preventDefault();
-    
-    // 标记所有字段为已触碰
-    const newTouched = {};
-    Object.keys(values).forEach(key => {
-      newTouched[key] = true;
-    });
-    setTouched(newTouched);
-    
-    // 验证所有字段
-    const validationErrors = validate(values);
-    setErrors(validationErrors);
-    
-    // 如果没有错误，执行回调
-    if (Object.keys(validationErrors).length === 0) {
-      callback(values);
-    }
-  };
-  
-  const reset = () => {
-    setValues(initialValues);
-    setErrors({});
-    setTouched({});
-  };
-  
-  return {
-    values,
-    errors,
-    touched,
-    handleChange,
-    handleBlur,
-    handleSubmit,
-    reset,
-  };
-}
-
-// 使用
-function LoginForm() {
-  const {
-    values,
-    errors,
-    touched,
-    handleChange,
-    handleBlur,
-    handleSubmit,
-  } = useForm(
-    { email: '', password: '' },
-    (values) => {
-      const errors = {};
-      if (!values.email) errors.email = 'Email is required';
-      if (!values.password) errors.password = 'Password is required';
-      return errors;
-    }
-  );
-  
-  const onSubmit = (formData) => {
-    console.log('Submitting:', formData);
-    api.login(formData);
-  };
-  
-  return (
-    <form onSubmit={handleSubmit(onSubmit)}>
-      <input
-        name="email"
-        value={values.email}
-        onChange={handleChange}
-        onBlur={handleBlur}
-      />
-      {touched.email && errors.email && (
-        <span className="error">{errors.email}</span>
-      )}
-      
-      <input
-        name="password"
-        type="password"
-        value={values.password}
-        onChange={handleChange}
-        onBlur={handleBlur}
-      />
-      {touched.password && errors.password && (
-        <span className="error">{errors.password}</span>
-      )}
-      
-      <button type="submit">Login</button>
-    </form>
-  );
-}
-```
-
-### 非受控组件
-
-**使用 useRef：**
-
-```javascript
-function UncontrolledForm() {
-  const usernameRef = useRef(null);
-  const emailRef = useRef(null);
-  const passwordRef = useRef(null);
-  
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    
-    const formData = {
-      username: usernameRef.current.value,
-      email: emailRef.current.value,
-      password: passwordRef.current.value,
-    };
-    
-    console.log('Form submitted:', formData);
-    submitForm(formData);
-  };
-  
-  return (
-    <form onSubmit={handleSubmit}>
-      <div>
-        <label>Username:</label>
-        <input
-          type="text"
-          name="username"
-          ref={usernameRef}
-          defaultValue=""
-        />
-      </div>
-      
-      <div>
-        <label>Email:</label>
-        <input
-          type="email"
-          name="email"
-          ref={emailRef}
-          defaultValue=""
-        />
-      </div>
-      
-      <div>
-        <label>Password:</label>
-        <input
-          type="password"
-          name="password"
-          ref={passwordRef}
-          defaultValue=""
-        />
-      </div>
-      
-      <button type="submit">Submit</button>
-    </form>
-  );
-}
-```
-
-**使用 FormData：**
-
-```javascript
-function FormDataForm() {
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    
-    // 使用 FormData API 获取表单数据
-    const formData = new FormData(e.target);
-    const data = Object.fromEntries(formData.entries());
-    
-    console.log('Form data:', data);
-    submitForm(data);
-  };
-  
-  return (
-    <form onSubmit={handleSubmit}>
-      <input name="username" />
-      <input name="email" type="email" />
-      <input name="password" type="password" />
-      <button type="submit">Submit</button>
-    </form>
-  );
-}
-```
-
-### 受控 vs 非受控组件
-
-| 特性 | 受控组件 | 非受控组件 |
-|------|---------|-----------|
-| **数据源** | React state | DOM ref |
-| **值控制** | 完全控制 | 默认值 |
-| **实时验证** | 容易 | 困难 |
-| **代码量** | 较多 | 较少 |
-| **适用场景** | 复杂表单、实时验证 | 简单表单、一次性提交 |
-
-### 表单库推荐
-
-**React Hook Form：**
-
-```javascript
-import { useForm } from 'react-hook-form';
-
-function ReactHookFormExample() {
-  const {
-    register,
-    handleSubmit,
-    formState: { errors },
-    reset,
-  } = useForm();
-  
-  const onSubmit = (data) => {
-    console.log('Form data:', data);
-    api.submit(data);
-  };
-  
-  return (
-    <form onSubmit={handleSubmit(onSubmit)}>
-      <div>
-        <label>Email:</label>
-        <input
-          type="email"
-          {...register('email', {
-            required: 'Email is required',
-            pattern: {
-              value: /\S+@\S+\.\S+/,
-              message: 'Email is invalid',
-            },
-          })}
-        />
-        {errors.email && (
-          <span className="error">{errors.email.message}</span>
-        )}
-      </div>
-      
-      <div>
-        <label>Password:</label>
-        <input
-          type="password"
-          {...register('password', {
-            required: 'Password is required',
-            minLength: {
-              value: 6,
-              message: 'Password must be at least 6 characters',
-            },
-          })}
-        />
-        {errors.password && (
-          <span className="error">{errors.password.message}</span>
-        )}
-      </div>
-      
-      <button type="submit">Submit</button>
-      <button type="button" onClick={() => reset()}>
-        Reset
-      </button>
-    </form>
-  );
-}
-```
-
-**Formik：**
-
-```javascript
-import { Formik, Form, Field, ErrorMessage } from 'formik';
-
-function FormikExample() {
-  const initialValues = {
-    email: '',
-    password: '',
-  };
-  
-  const validate = (values) => {
-    const errors = {};
-    
-    if (!values.email) {
-      errors.email = 'Email is required';
-    } else if (!/\S+@\S+\.\S+/.test(values.email)) {
-      errors.email = 'Email is invalid';
-    }
-    
-    if (!values.password) {
-      errors.password = 'Password is required';
-    }
-    
-    return errors;
-  };
-  
-  const handleSubmit = (values, { setSubmitting }) => {
-    setTimeout(() => {
-      console.log('Form data:', values);
-      setSubmitting(false);
-    }, 400);
-  };
-  
-  return (
-    <Formik
-      initialValues={initialValues}
-      validate={validate}
-      onSubmit={handleSubmit}
-    >
-      {({ isSubmitting }) => (
-        <Form>
-          <div>
-            <label>Email:</label>
-            <Field type="email" name="email" />
-            <ErrorMessage name="email" component="div" className="error" />
-          </div>
-          
-          <div>
-            <label>Password:</label>
-            <Field type="password" name="password" />
-            <ErrorMessage name="password" component="div" className="error" />
-          </div>
-          
-          <button type="submit" disabled={isSubmitting}>
-            Submit
-          </button>
-        </Form>
-      )}
-    </Formik>
-  );
-}
-```
-
-### 最佳实践
-
-```javascript
-// 1. 选择合适的方式
-// - 简单表单 → 非受控组件
-// - 复杂表单 → 受控组件
-// - 大型表单 → 使用表单库
-
-// 2. 实时验证
-// - 提供即时反馈
-// - 使用 debounce 优化性能
-
-// 3. 良好的用户体验
-// - 清晰的错误提示
-// - 合理的默认值
-// - 表单重置功能
-
-// 4. 可访问性
-// - 使用 label 关联 input
-// - 正确的 type 属性
-// - 键盘导航支持
-
-// 5. 安全性
-// - 验证用户输入
-// - 防止 XSS 攻击
-// - HTTPS 提交敏感数据
-```
-
-### 总结
-
-**选择指南：**
-
-- **受控组件** - 需要实时验证、复杂表单
-- **非受控组件** - 简单表单、一次性提交
-- **表单库** - 大型表单、需要高级功能
-
-**最佳实践：**
-
-- 合理使用受控和非受控
-- 提供良好的用户反馈
-- 注意表单的可访问性
-- 考虑安全性问题
-- 根据场景选择合适的方案
-
----
-
-## 26、React中如何做国际化（i18n）？常用的库有哪些？
-
-### 基本的国际化实现
-
-**自定义实现：**
-
-```javascript
-// 1. 创建翻译字典
-const translations = {
-  en: {
-    welcome: 'Welcome',
-    hello: 'Hello, {name}!',
-    login: 'Login',
-    logout: 'Logout',
-  },
-  zh: {
-    welcome: '欢迎',
-    hello: '你好，{name}！',
-    login: '登录',
-    logout: '退出',
-  },
-};
-
-// 2. 创建 Context
-const I18nContext = createContext();
-
-function I18nProvider({ children }) {
-  const [locale, setLocale] = useState('zh');
-  const [translations, setTranslations] = useState(translations[locale]);
-  
-  const changeLocale = (newLocale) => {
-    setLocale(newLocale);
-    setTranslations(translations[newLocale]);
-  };
-  
-  const t = (key, params = {}) => {
-    let text = translations[key] || key;
-    
-    // 替换参数
-    Object.keys(params).forEach(param => {
-      text = text.replace(`{${param}}`, params[param]);
-    });
-    
-    return text;
-  };
-  
-  return (
-    <I18nContext.Provider value={{ locale, t, changeLocale }}>
-      {children}
-    </I18nContext.Provider>
-  );
-}
-
-// 3. 使用
-function Welcome() {
-  const { t } = useContext(I18nContext);
-  
-  return (
-    <div>
-      <h1>{t('welcome')}</h1>
-      <p>{t('hello', { name: 'John' })}</p>
-    </div>
-  );
-}
-
-function LanguageSwitcher() {
-  const { locale, changeLocale } = useContext(I18nContext);
-  
-  return (
-    <div>
-      <button 
-        onClick={() => changeLocale('en')}
-        disabled={locale === 'en'}
-      >
-        English
-      </button>
-      <button 
-        onClick={() => changeLocale('zh')}
-        disabled={locale === 'zh'}
-      >
-        中文
-      </button>
-    </div>
-  );
-}
-```
-
-### react-i18next
-
-**配置：**
-
-```javascript
-// i18n.js
-import i18n from 'i18next';
-import { initReactI18next } from 'react-i18next';
-
-i18n
-  .use(initReactI18next)
-  .init({
-    resources: {
-      en: {
-        translation: {
-          welcome: 'Welcome',
-          hello: 'Hello, {{name}}!',
-        },
-      },
-      zh: {
-        translation: {
-          welcome: '欢迎',
-          hello: '你好，{{name}}！',
-        },
-      },
-    },
-    lng: 'zh',
-    fallbackLng: 'en',
-    interpolation: {
-      escapeValue: false,
-    },
-  });
-
-export default i18n;
-
-// index.js
-import React from 'react';
-import ReactDOM from 'react-dom/client';
-import App from './App';
-import './i18n';
-
-const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
-);
-```
-
-**使用：**
-
-```javascript
-import { useTranslation } from 'react-i18next';
-
-function MyComponent() {
-  const { t, i18n } = useTranslation();
-  
-  const changeLanguage = (lng) => {
-    i18n.changeLanguage(lng);
-  };
-  
-  return (
-    <div>
-      <h1>{t('welcome')}</h1>
-      <p>{t('hello', { name: 'John' })}</p>
-      
-      <div>
-        <button onClick={() => changeLanguage('en')}>
-          English
-        </button>
-        <button onClick={() => changeLanguage('zh')}>
-          中文
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// 使用命名空间
-i18n.init({
-  resources: {
-    en: {
-      common: {
-        welcome: 'Welcome',
-      },
-      about: {
-        title: 'About Us',
-      },
-    },
-  },
-});
-
-function AboutPage() {
-  const { t } = useTranslation('about');
-  
-  return <h1>{t('title')}</h1>;
-}
-```
-
-**懒加载翻译：**
-
-```javascript
-i18n.use(initReactI18next).init({
-  lng: 'en',
-  fallbackLng: 'en',
-  // 懒加载翻译文件
-  backend: {
-    loadPath: '/locales/{{lng}}/{{ns}}.json',
-  },
-});
-
-// 动态加载语言包
-const loadLanguage = async (lng) => {
-  const translations = await import(`./locales/${lng}.json`);
-  i18n.addResourceBundle(lng, 'translation', translations);
-  await i18n.changeLanguage(lng);
-};
-```
-
-### formatjs (React Intl)
-
-**配置：**
-
-```javascript
-import { IntlProvider } from 'react-intl';
-import English from './locales/en.json';
-import Chinese from './locales/zh.json';
-
-const messages = {
-  en: English,
-  zh: Chinese,
-};
-
-function App() {
-  const [locale, setLocale] = useState('zh');
-  
-  return (
-    <IntlProvider locale={locale} messages={messages[locale]}>
-      <MyComponent />
-    </IntlProvider>
-  );
-}
-```
-
-**使用：**
-
-```javascript
-import { FormattedMessage, FormattedNumber, FormattedDate } from 'react-intl';
-
-function MyComponent() {
-  return (
-    <div>
-      {/* 简单文本 */}
-      <FormattedMessage
-        id="welcome"
-        defaultMessage="Welcome"
-      />
-      
-      {/* 带参数的文本 */}
-      <FormattedMessage
-        id="hello"
-        defaultMessage="Hello, {name}!"
-        values={{ name: 'John' }}
-      />
-      
-      {/* 数字格式化 */}
-      <FormattedNumber
-        value={1234.56}
-        style="currency"
-        currency="USD"
-      />
-      
-      {/* 日期格式化 */}
-      <FormattedDate
-        value={new Date()}
-        year="numeric"
-        month="long"
-        day="numeric"
-      />
-    </div>
-  );
-}
-
-// 使用 useIntl hook
-import { useIntl } from 'react-intl';
-
-function MyComponent() {
-  const intl = useIntl();
-  
-  return (
-    <div>
-      {intl.formatMessage({
-        id: 'welcome',
-        defaultMessage: 'Welcome',
-      })}
-    </div>
-  );
-}
-```
-
-### 国际化库对比
-
-| 库 | 特点 | 优点 | 缺点 |
-|-----|------|------|------|
-| **react-i18next** | 功能强大 | 插件丰富、懒加载 | 配置复杂 |
-| **react-intl** | 官方推荐 | 格式化功能强大 | 学习曲线 |
-| **自定义实现** | 简单灵活 | 轻量级 | 功能有限 |
-
-### 最佳实践
-
-```javascript
-// 1. 翻译文件分离
-// locales/en.json
-{
-  "common": {
-    "welcome": "Welcome",
-    "login": "Login"
-  },
-  "dashboard": {
-    "title": "Dashboard",
-    "stats": "Statistics"
-  }
-}
-
-// 2. 使用命名空间
-// 避免命名冲突
-// 便于管理大型项目
-
-// 3. 提供默认值
-// 翻译缺失时显示默认值
-// 避免显示 key
-
-// 4. 复数形式
-{
-  "item": "One item",
-  "item_other": "{{count}} items"
-}
-
-// 5. 日期和数字格式化
-// 根据语言环境自动格式化
-// 使用内置的格式化功能
-```
-
-### 总结
-
-**选择建议：**
-
-- **小型项目** - 自定义实现
-- **中型项目** - react-i18next
-- **大型项目** - react-intl
-
-**最佳实践：**
-
-- 分离翻译文件
-- 使用命名空间
-- 提供默认值
-- 支持复数形式
-- 格式化日期和数字
-
----
-
-## 27、React中如何做单元测试和集成测试？
-
-### Jest + React Testing Library
-
-**基本设置：**
-
-```javascript
-// MyComponent.test.js
-import { render, screen, fireEvent } from '@testing-library/react';
-import MyComponent from './MyComponent';
-
-describe('MyComponent', () => {
-  test('renders heading', () => {
-    render(<MyComponent />);
-    const heading = screen.getByRole('heading', { name: /hello/i });
-    expect(heading).toBeInTheDocument();
-  });
-  
-  test('button click changes text', () => {
-    render(<MyComponent />);
-    const button = screen.getByRole('button', { name: /click me/i });
-    fireEvent.click(button);
-    expect(screen.getByText(/clicked/i)).toBeInTheDocument();
-  });
-});
-```
-
-**测试用户交互：**
-
-```javascript
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import Counter from './Counter';
-
-describe('Counter', () => {
-  test('increments count on button click', () => {
-    render(<Counter />);
-    const button = screen.getByRole('button', { name: /increment/i });
-    const count = screen.getByTestId('count');
-    
-    expect(count).toHaveTextContent('0');
-    
-    fireEvent.click(button);
-    expect(count).toHaveTextContent('1');
-    
-    fireEvent.click(button);
-    expect(count).toHaveTextContent('2');
-  });
-  
-  test('async operation updates UI', async () => {
-    render(<Counter />);
-    const loadButton = screen.getByRole('button', { name: /load/i });
-    
-    fireEvent.click(loadButton);
-    
-    // 等待异步操作完成
-    await waitFor(() => {
-      expect(screen.getByText(/loaded/i)).toBeInTheDocument();
-    });
-  });
-});
-```
-
-**测试异步组件：**
-
-```javascript
-import { render, screen, waitFor } from '@testing-library/react';
-import UserProfile from './UserProfile';
-import { getUser } from './api';
-
-// Mock API
-jest.mock('./api');
-
-describe('UserProfile', () => {
-  test('displays user data', async () => {
-    const mockUser = { id: 1, name: 'John Doe' };
-    getUser.mockResolvedValue(mockUser);
-    
-    render(<UserProfile userId={1} />);
-    
-    // 等待数据加载
-    await waitFor(() => {
-      expect(screen.getByText(/john doe/i)).toBeInTheDocument();
-    });
-  });
-  
-  test('displays loading state', () => {
-    getUser.mockImplementation(() => new Promise(() => {}));
-    
-    render(<UserProfile userId={1} />);
-    
-    expect(screen.getByText(/loading/i)).toBeInTheDocument();
-  });
-});
-```
-
-### 测试 Hooks
-
-```javascript
-import { renderHook, act, waitFor } from '@testing-library/react';
-import useCounter from './useCounter';
-import useUserData from './useUserData';
-
-describe('useCounter', () => {
-  test('increments count', () => {
-    const { result } = renderHook(() => useCounter());
-    
-    expect(result.current.count).toBe(0);
-    
-    act(() => {
-      result.current.increment();
-    });
-    
-    expect(result.current.count).toBe(1);
-  });
-});
-
-describe('useUserData', () => {
-  test('fetches and returns user data', async () => {
-    const mockUser = { id: 1, name: 'John' };
-    global.fetch = jest.fn(() =>
-      Promise.resolve({
-        json: () => Promise.resolve(mockUser),
-      })
-    );
-    
-    const { result } = renderHook(() => useUserData(1));
-    
-    await waitFor(() => {
-      expect(result.current.user).toEqual(mockUser);
-    });
-  });
-});
-```
-
-### 测试 Redux
-
-```javascript
-import { render, screen, fireEvent } from '@testing-library/react';
-import { Provider } from 'react-redux';
-import { configureStore } from '@reduxjs/toolkit';
-import Counter from './Counter';
-import counterReducer from './counterSlice';
-
-function createTestStore() {
-  return configureStore({
-    reducer: {
-      counter: counterReducer,
-    },
-  });
-}
-
-describe('Counter with Redux', () => {
-  test('renders count from store', () => {
-    const store = createTestStore();
-    render(
-      <Provider store={store}>
-        <Counter />
-      </Provider>
-    );
-    
-    expect(screen.getByTestId('count')).toHaveTextContent('0');
-  });
-  
-  test('dispatches increment action', () => {
-    const store = createTestStore();
-    render(
-      <Provider store={store}>
-        <Counter />
-      </Provider>
-    );
-    
-    const button = screen.getByRole('button', { name: /increment/i });
-    fireEvent.click(button);
-    
-    expect(store.getState().counter.value).toBe(1);
-  });
-});
-```
-
-### 测试 React Router
-
-```javascript
-import { render, screen } from '@testing-library/react';
-import { BrowserRouter } from 'react-router-dom';
-import App from './App';
-
-describe('App routing', () => {
-  test('renders home page', () => {
-    render(
-      <BrowserRouter>
-        <App />
-      </BrowserRouter>
-    );
-    
-    expect(screen.getByText(/home page/i)).toBeInTheDocument();
-  });
-  
-  test('navigates to about page', () => {
-    render(
-      <BrowserRouter initialEntries={['/about']}>
-        <App />
-      </BrowserRouter>
-    );
-    
-    expect(screen.getByText(/about us/i)).toBeInTheDocument();
-  });
-});
-```
-
-### 测试最佳实践
-
-```javascript
-// 1. 测试用户行为，不是实现细节
-// ✓ good: 用户点击按钮，文本改变
-// ✗ bad: state 从 0 变为 1
-
-// 2. 使用可访问性选择器
-// ✓ good: getByRole('button')
-// ✗ bad: getByClassName('btn')
-
-// 3. 避免测试第三方库
-// 不要测试 React Router、Redux 等库的功能
-
-// 4. 使用快照测试谨慎
-// ✓ good: UI 组件的快照
-// ✗ bad: 业务逻辑的快照
-
-// 5. Mock 外部依赖
-// API、浏览器 API 等
-```
-
-### 测试覆盖率
-
-```javascript
-// package.json
-{
-  "scripts": {
-    "test": "jest",
-    "test:coverage": "jest --coverage"
-  }
-}
-
-// jest.config.js
+// 静态资源 CDN 配置
+// next.config.js
 module.exports = {
-  collectCoverageFrom: [
-    'src/**/*.{js,jsx}',
-    '!src/**/*.d.ts',
-    '!src/**/*.stories.{js,jsx}',
-    '!src/**/__tests__/**',
-  ],
-  coverageThreshold: {
-    global: {
-      branches: 80,
-      functions: 80,
-      lines: 80,
-      statements: 80,
-    },
+  assetPrefix: 'https://cdn.example.com',
+  images: {
+    domains: ['cdn.example.com'],
+    loader: 'custom',
+    loaderFile: './image-loader.js',
   },
 };
-```
 
-### 总结
-
-**测试工具：**
-
-- **单元测试** - Jest
-- **组件测试** - React Testing Library
-- **E2E 测试** - Cypress, Playwright
-
-**测试策略：**
-
-- 测试用户行为
-- 使用可访问性选择器
-- Mock 外部依赖
-- 保持测试简单
-- 设置合理的覆盖率目标
-
----
-
-## 28、React项目如何进行代码分割和懒加载？
-
-### 动态导入（Dynamic Imports）
-
-**基础用法：**
-
-```javascript
-import { lazy, Suspense } from 'react';
-
-// 懒加载组件
-const HeavyComponent = lazy(() => import('./HeavyComponent'));
-
-function App() {
-  return (
-    <div>
-      <Suspense fallback={<div>Loading component...</div>}>
-        <HeavyComponent />
-      </Suspense>
-    </div>
-  );
-}
-```
-
-**路由懒加载：**
-
-```javascript
-import { lazy, Suspense } from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-
-// 懒加载页面组件
-const Home = lazy(() => import('./pages/Home'));
-const About = lazy(() => import('./pages/About'));
-const Contact = lazy(() => import('./pages/Contact'));
-const Dashboard = lazy(() => import('./pages/Dashboard'));
-
-function App() {
-  return (
-    <BrowserRouter>
-      <Suspense fallback={<div>Loading page...</div>}>
-        <Routes>
-          <Route path="/" element={<Home />} />
-          <Route path="/about" element={<About />} />
-          <Route path="/contact" element={<Contact />} />
-          <Route path="/dashboard" element={<Dashboard />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </Suspense>
-    </BrowserRouter>
-  );
-}
-```
-
-**条件懒加载：**
-
-```javascript
-import { lazy, Suspense, useState } from 'react';
-
-function App() {
-  const [showModal, setShowModal] = useState(false);
-  
-  const Modal = lazy(() => import('./Modal'));
-  
-  return (
-    <div>
-      <button onClick={() => setShowModal(true)}>
-        Open Modal
-      </button>
-      
-      {showModal && (
-        <Suspense fallback={<div>Loading modal...</div>}>
-          <Modal onClose={() => setShowModal(false)} />
-        </Suspense>
-      )}
-    </div>
-  );
-}
-```
-
-### Webpack 代码分割
-
-**按路由分割：**
-
-```javascript
-// 每个路由自动分割为单独的 chunk
-const routes = [
-  {
-    path: '/',
-    component: lazy(() => import('./pages/Home')),
-  },
-  {
-    path: '/about',
-    component: lazy(() => import('./pages/About')),
-  },
-  {
-    path: '/dashboard',
-    component: lazy(() => import('./pages/Dashboard')),
-  },
-];
-```
-
-**按功能分割：**
-
-```javascript
-// admin 相关的代码分割在一起
-const AdminPanel = lazy(() => 
-  import(/* webpackChunkName: "admin" */ './admin/AdminPanel')
-);
-
-const UserManagement = lazy(() =>
-  import(/* webpackChunkName: "admin" */ './admin/UserManagement')
-);
-
-const Settings = lazy(() =>
-  import(/* webpackChunkName: "admin" */ './admin/Settings')
-);
-```
-
-**预加载（Prefetch）：**
-
-```javascript
-import { lazy } from 'react';
-
-// 预加载组件（用户可能需要）
-const HeavyComponent = lazy(() => import(
-  /* webpackPrefetch: true */ 
-  './HeavyComponent'
-));
-
-function App() {
-  return (
-    <div>
-      <button onClick={() => setShowHeavy(true)}>
-        Load Heavy Component
-      </button>
-      {/* HeavyComponent 代码在空闲时预加载 */}
-    </div>
-  );
-}
-```
-
-**预获取（Preload）：**
-
-```javascript
-// 立即预获取（当前导航可能需要）
-const NextPageComponent = lazy(() => import(
-  /* webpackPreload: true */ 
-  './NextPage'
-));
-```
-
-### React.lazy 最佳实践
-
-```javascript
-// 1. 使用 Error Boundary
-import { ErrorBoundary } from './ErrorBoundary';
-
-function App() {
-  return (
-    <ErrorBoundary>
-      <Suspense fallback={<LoadingSpinner />}>
-        <LazyComponent />
-      </Suspense>
-    </ErrorBoundary>
-  );
-}
-
-// 2. 提供有意义的 loading 状态
-function LoadingSpinner() {
-  return (
-    <div className="loading-container">
-      <Spinner />
-      <p>Loading...</p>
-    </div>
-  );
-}
-
-// 3. 使用骨架屏
-function SkeletonLoader() {
-  return (
-    <div className="skeleton">
-      <div className="skeleton-header" />
-      <div className="skeleton-body" />
-    </div>
-  );
-}
-
-// 4. 分级加载
-function App() {
-  return (
-    <Suspense fallback={<SkeletonLoader />}>
-      <Layout>
-        <Suspense fallback={<MiniLoader />}>
-          <Content />
-        </Suspense>
-      </Layout>
-    </Suspense>
-  );
-}
-```
-
-### 分析打包结果
-
-```bash
-# 安装 webpack-bundle-analyzer
-npm install --save-dev webpack-bundle-analyzer
-
-# 配置 webpack
-const BundleAnalyzerPlugin = require('webpack-bundle-analyzer').BundleAnalyzerPlugin;
-
-module.exports = {
-  plugins: [
-    new BundleAnalyzerPlugin({
-      analyzerMode: 'server',
-      analyzerPort: 8888,
-      openAnalyzer: true,
-    }),
-  ],
-};
-
-# 运行分析
-npm run build
-
-# 或者在 Next.js 中
-ANALYZE=true npm run build
-```
-
-### 优化策略
-
-```javascript
-// 1. 第三方库单独打包
-const OptimizedApp = () => {
-  return (
-    <div>
-      {/* 大型库延迟加载 */}
-      <Suspense fallback={<div>Loading...</div>}>
-        <ReactECharts />
-      </Suspense>
-    </div>
-  );
-};
-
-// 2. 共享代码提取
-// Webpack 自动提取公共代码
-
-// 3. Tree Shaking
-// 只导入需要的模块
-import { debounce } from 'lodash-es'; // 而不是 import _ from 'lodash'
-
-// 4. 使用 ES Module
-// 支持更好的 tree shaking
-```
-
-### 性能监控
-
-```javascript
-// 监控懒加载性能
-const LazyComponent = lazy(() => 
-  import('./HeavyComponent').then(module => {
-    // 记录加载时间
-    console.log('Component loaded in:', performance.now());
-    return module;
-  })
-);
-
-// 使用 React.lazy 配合资源提示
-<link rel="preload" href="/heavy-component.js" as="script" />
-```
-
-### 总结
-
-**代码分割策略：**
-
-- **路由级别** - 每个页面单独打包
-- **功能级别** - 相关功能打包在一起
-- **组件级别** - 大型组件按需加载
-
-**优化技巧：**
-
-- 使用 Suspense 提供加载状态
-- Error Boundary 处理错误
-- 预加载可能需要的代码
-- 分析打包结果优化
-- 监控加载性能
-
----
-
-## 29、React项目如何进行性能监控和分析？
-
-### React DevTools Profiler
-
-**基础使用：**
-
-```javascript
-import { Profiler } from 'react';
-
-function onRenderCallback(
-  id,              // 组件的 id
-  phase,           // "mount" 或 "update"
-  actualDuration,  // 组件渲染花费的时间
-  baseDuration,    // 不使用 memo 时的渲染时间
-  startTime,       // 开始渲染的时间
-  commitTime,      // 提交的时间
-  interactions     // 本次更新涉及的 interactions
-) {
-  console.log({
-    id,
-    phase,
-    actualDuration,
-    baseDuration,
-    interactions,
-  });
-}
-
-function App() {
-  return (
-    <Profiler id="App" onRender={onRenderCallback}>
-      <Navigation />
-      <Router />
-      <Footer />
-    </Profiler>
-  );
-}
-
-// 使用 Profiler 标签测量性能
-function PerformanceExample() {
-  return (
-    <div>
-      <Profiler id="Navigation" onRender={onRenderCallback}>
-        <Navigation />
-      </Profiler>
-      
-      <Profiler id="Router" onRender={onRenderCallback}>
-        <Router />
-      </Profiler>
-    </div>
-  );
-}
-```
-
-### 自定义性能监控
-
-```javascript
-// 性能监控工具
-class PerformanceMonitor {
-  constructor() {
-    this.metrics = [];
-  }
-  
-  // 记录渲染时间
-  recordRender(componentName, duration) {
-    this.metrics.push({
-      type: 'render',
-      component: componentName,
-      duration,
-      timestamp: performance.now(),
-    });
-    
-    // 上报到监控系统
-    this.report({
-      metric: 'component_render',
-      component: componentName,
-      duration,
-    });
-  }
-  
-  // 记录 API 请求
-  recordRequest(url, duration, status) {
-    this.metrics.push({
-      type: 'request',
-      url,
-      duration,
-      status,
-      timestamp: performance.now(),
-    });
-    
-    this.report({
-      metric: 'api_request',
-      url,
-      duration,
-      status,
-    });
-  }
-  
-  // 记录用户交互
-  recordInteraction(type, duration) {
-    this.metrics.push({
-      type: 'interaction',
-      interactionType: type,
-      duration,
-      timestamp: performance.now(),
-    });
-  }
-  
-  // 上报数据
-  report(data) {
-    // 发送到监控服务
-    fetch('/api/metrics', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    }).catch(err => console.error('Failed to report metrics:', err));
-  }
-  
-  // 获取性能报告
-  getReport() {
-    const renders = this.metrics.filter(m => m.type === 'render');
-    const requests = this.metrics.filter(m => m.type === 'request');
-    
-    return {
-      renders: {
-        count: renders.length,
-        averageDuration: renders.reduce((acc, m) => acc + m.duration, 0) / renders.length,
-        slowestComponent: renders.reduce((max, m) => m.duration > max.duration ? m : max),
-      },
-      requests: {
-        count: requests.length,
-        averageDuration: requests.reduce((acc, m) => acc + m.duration, 0) / requests.length,
-        slowestRequest: requests.reduce((max, m) => m.duration > max.duration ? m : max),
-      },
-    };
-  }
-}
-
-const monitor = new PerformanceMonitor();
-```
-
-**与 React 集成：**
-
-```javascript
-function withPerformanceMonitor(Component) {
-  return function MonitoredComponent(props) {
-    const renderStart = useRef(performance.now());
-    
-    useEffect(() => {
-      const renderDuration = performance.now() - renderStart.current;
-      monitor.recordRender(Component.name, renderDuration);
-    });
-    
-    return <Component {...props} />;
-  };
-}
-
-// 使用
-const MonitoredDashboard = withPerformanceMonitor(Dashboard);
-```
-
-### Web Vitals 监控
-
-```javascript
-// web-vitals 库
-import { getCLS, getFID, getFCP, getLCP, getTTFB } from 'web-vitals';
-
-function reportWebVitals(metric) {
-  // 上报到监控服务
-  console.log(metric);
-  
-  // 发送到分析服务
-  fetch('/api/analytics', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(metric),
-  });
-}
-
-// 监控核心 Web 指标
-getCLS(reportWebVitals);  // Cumulative Layout Shift
-getFID(reportWebVitals); // First Input Delay
-getFCP(reportWebVitals); // First Contentful Paint
-getLCP(reportWebVitals); // Largest Contentful Paint
-getTTFB(reportWebVitals); // Time to First Byte
-
-// 自定义监控
-function reportPerfEntry(entry) {
-  if (entry.entryType === 'measure') {
-    console.log(`${entry.name}: ${entry.duration}ms`);
-  }
-}
-
-const observer = new PerformanceObserver((list) => {
-  for (const entry of list.getEntries()) {
-    reportPerfEntry(entry);
-  }
-});
-
-observer.observe({ entryTypes: ['measure', 'paint'] });
-```
-
-### 性能分析
-
-```javascript
-// 分析渲染性能
-function analyzePerformance() {
-  // Performance API
-  const perfData = performance.getEntriesByType('navigation')[0];
-  
-  const metrics = {
-    // DNS 查询时间
-    dnsLookup: perfData.domainLookupEnd - perfData.domainLookupStart,
-    // TCP 连接时间
-    tcpConnection: perfData.connectEnd - perfData.connectStart,
-    // 请求时间
-    requestTime: perfData.responseEnd - perfData.requestStart,
-    // DOM 解析时间
-    domParse: perfData.domComplete - perfData.domInteractive,
-    // 白屏时间
-    whiteScreen: perfData.responseStart - perfData.fetchStart,
-    // 首屏时间
-    firstScreen: perfData.domContentLoadedEventEnd - perfData.fetchStart,
-    // 完全加载时间
-    fullLoad: perfData.loadEventEnd - perfData.fetchStart,
-  };
-  
-  return metrics;
-}
-
-// 使用
-const metrics = analyzePerformance();
-console.log('Performance Metrics:', metrics);
-```
-
-### 错误监控
-
-```javascript
-// 全局错误监控
-window.addEventListener('error', (event) => {
-  console.error('Error:', event.error);
-  
-  // 上报错误
-  reportError({
-    type: 'javascript_error',
-    message: event.message,
-    filename: event.filename,
-    lineno: event.lineno,
-    colno: event.colno,
-    stack: event.error?.stack,
-  });
-});
-
-// Promise 错误
-window.addEventListener('unhandledrejection', (event) => {
-  console.error('Unhandled rejection:', event.reason);
-  
-  reportError({
-    type: 'unhandled_promise',
-    reason: event.reason,
-  });
-});
-
-// React 错误边界
-class ErrorBoundary extends React.Component {
-  componentDidCatch(error, errorInfo) {
-    console.error('React error:', error, errorInfo);
-    
-    reportError({
-      type: 'react_error',
-      error,
-      componentStack: errorInfo.componentStack,
-    });
-  }
-}
-```
-
-### 集成第三方监控服务
-
-**Sentry 集成：**
-
-```javascript
-import * as Sentry from '@sentry/react';
-
-// 初始化 Sentry
-Sentry.init({
-  dsn: 'your-dsn-here',
-  environment: process.env.NODE_ENV,
-  release: process.env.REACT_APP_VERSION,
-  
-  // 性能监控
-  integrations: [
-    new Sentry.BrowserTracing(),
-    new Sentry.Replay(),
-  ],
-  
-  // 采样率
-  tracesSampleRate: 1.0, // 性能追踪采样率
-  replaysSessionSampleRate: 0.1, // 回放采样率
-  replaysOnErrorSampleRate: 1.0, // 错误回放采样率
-});
-
-// 手动捕获错误
-try {
-  // 可能出错的代码
-} catch (error) {
-  Sentry.captureException(error);
-}
-
-// 添加用户上下文
-Sentry.setUser({
-  id: '123',
-  email: 'user@example.com',
-});
-
-// 添加自定义上下文
-Sentry.setContext('additional_info', {
-  page: window.location.pathname,
-  userAgent: navigator.userAgent,
-});
-```
-
-**Google Analytics：**
-
-```javascript
-// React Google Analytics
-import ReactGA from 'react-ga';
-
-ReactGA.initialize('UA-XXXXXXXXX-X');
-
-// 页面浏览
-ReactGA.pageview(window.location.pathname);
-
-// 自定义事件
-ReactGA.event({
-  category: 'User',
-  action: 'Button Click',
-  label: 'Submit',
-});
-
-// 性能监控
-ReactGA.timing({
-  category: 'Loading',
-  variable: 'Page Load',
-  value: performance.now(),
-});
-```
-
-### 性能优化建议
-
-```javascript
-// 1. 使用 React.memo 优化组件
-const MemoizedComponent = React.memo(Component);
-
-// 2. 使用 useMemo 和 useCallback
-const memoizedValue = useMemo(() => computeExpensiveValue(a, b), [a, b]);
-const memoizedCallback = useCallback(() => doSomething(a, b), [a, b]);
-
-// 3. 虚拟化长列表
-import { FixedSizeList } from 'react-window';
-
-// 4. 懒加载组件
-const LazyComponent = lazy(() => import('./Component'));
-
-// 5. 图片优化
+// 图片优化
 import Image from 'next/image';
 
-<Image src="/hero.jpg" alt="Hero" width={800} height={600} />
-```
-
-### 总结
-
-**监控指标：**
-
-- **性能指标** - LCP, FCP, FID, CLS
-- **渲染性能** - 组件渲染时间
-- **API 性能** - 请求时间和成功率
-- **错误率** - JavaScript 错误和网络错误
-
-**监控工具：**
-
-- **React DevTools Profiler** - 组件性能分析
-- **Web Vitals** - 核心网页指标
-- **Sentry** - 错误监控和性能追踪
-- **Lighthouse** - 性能审计
-
-**优化策略：**
-
-- 识别性能瓶颈
-- 优化慢速组件
-- 减少不必要的渲染
-- 优化资源加载
-- 监控优化效果
-
----
-
-## 30、React最佳实践有哪些？如何编写高质量的React代码？
-
-### 组件设计原则
-
-**1. 单一职责原则（SRP）**
-
-```javascript
-// ❌ 错误：组件职责过多
-function BadComponent() {
-  const [users, setUsers] = useState([]);
-  const [posts, setPosts] = useState([]);
-  const [comments, setComments] = useState([]);
-  
-  // 获取多个数据
-  useEffect(() => {
-    fetchUsers().then(setUsers);
-    fetchPosts().then(setPosts);
-    fetchComments().then(setComments);
-  }, []);
-  
-  // 复杂的渲染逻辑
+function ProductCard({ product }) {
   return (
     <div>
-      <UserList users={users} />
-      <PostList posts={posts} />
-      <CommentList comments={comments} />
-      {/* 更多渲染逻辑 */}
-    </div>
-  );
-}
-
-// ✅ 正确：拆分为小组件
-function UserList({ users }) {
-  return <ul>{users.map(user => <li key={user.id}>{user.name}</li>)}</ul>;
-}
-
-function PostList({ posts }) {
-  return <ul>{posts.map(post => <li key={post.id}>{post.title}</li>)}</ul>;
-}
-
-function CommentList({ comments }) {
-  return <ul>{comments.map(c => <li key={c.id}>{c.text}</li>)}</ul>;
-}
-
-function Dashboard() {
-  return (
-    <div>
-      <UserSection />
-      <PostSection />
-      <CommentSection />
+      <Image
+        src={product.image}
+        alt={product.name}
+        width={300}
+        height={200}
+        loading="lazy"  // 懒加载
+        placeholder="blur"  // 模糊占位
+        blurDataURL="data:image/jpeg;base64,/..."  // 模糊数据
+      />
     </div>
   );
 }
 ```
 
-**2. 关注点分离**
+#### 5. 流式渲染优化
 
 ```javascript
-// ✅ 数据逻辑抽离为自定义 Hook
-function useUsers() {
-  const [users, setUsers] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
+// 使用 Suspense 实现渐进式渲染
+import { Suspense } from 'react';
+
+async function ProductPage({ id }) {
+  const product = await getProduct(id);
   
-  const fetchUsers = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await api.getUsers();
-      setUsers(data);
-    } catch (err) {
-      setError(err);
-    } finally {
-      setLoading(false);
+  return (
+    <div>
+      <h1>{product.name}</h1>
+      <p>{product.description}</p>
+      
+      {/* 关键内容优先渲染 */}
+      <ProductPrice price={product.price} />
+      
+      {/* 评论等非关键内容延迟加载 */}
+      <Suspense fallback={<div>Loading reviews...</div>}>
+        <ProductReviews productId={id} />
+      </Suspense>
+      
+      <Suspense fallback={<div>Loading recommendations...</div>}>
+        <ProductRecommendations productId={id} />
+      </Suspense>
+    </div>
+  );
+}
+```
+
+#### 6. 服务端缓存和 ISR
+
+```javascript
+// Next.js ISR（增量静态再生）
+export async function getStaticProps() {
+  const products = await getProducts();
+  
+  return {
+    props: { products },
+    revalidate: 60,  // 60秒后重新生成
+  };
+}
+
+// 按需 ISR
+export async function getStaticPaths() {
+  const products = await getProducts();
+  
+  return {
+    paths: products.map(p => ({ params: { id: p.id } })),
+    fallback: 'blocking',  // 按需生成
+  };
+}
+
+// 自定义 ISR 逻辑
+function withISR(handler, revalidateTime) {
+  return async (req, res) => {
+    const cacheKey = `isr:${req.url}`;
+    const cached = await redis.get(cacheKey);
+    
+    if (cached) {
+      const { data, timestamp } = JSON.parse(cached);
+      const age = Date.now() - timestamp;
+      
+      if (age < revalidateTime * 1000) {
+        return res.send(data);
+      }
     }
+    
+    // 重新生成
+    const result = await handler(req, res);
+    
+    // 异步更新缓存
+    setImmediate(async () => {
+      const freshResult = await handler(req, res);
+      await redis.setex(
+        cacheKey,
+        revalidateTime,
+        JSON.stringify({
+          data: freshResult,
+          timestamp: Date.now()
+        })
+      );
+    });
+    
+    return result;
   };
-  
-  useEffect(() => {
-    fetchUsers();
-  }, []);
-  
-  return { users, loading, error, refetch: fetchUsers };
-}
-
-// 组件只负责渲染
-function UserList() {
-  const { users, loading, error } = useUsers();
-  
-  if (loading) return <Spinner />;
-  if (error) return <Error message={error.message} />;
-  
-  return <ul>{users.map(user => <li key={user.id}>{user.name}</li>)}</ul>;
 }
 ```
 
-**3. 组合优于继承**
+#### 7. 性能监控
 
 ```javascript
-// ❌ 错误：使用继承
-class Button extends React.Component {
-  render() {
-    return <button className={this.props.className} onClick={this.props.onClick}>
-      {this.props.children}
-    </button>;
-  }
-}
+// 服务端性能监控
+import { performance } from 'perf_hooks';
 
-class PrimaryButton extends Button {
-  render() {
-    return super.render(); // 不容易扩展
-  }
-}
-
-// ✅ 正确：使用组合
-function Button({ variant = 'default', ...props }) {
-  const className = `btn btn-${variant}`;
-  return <button className={className} {...props} />;
-}
-
-// 使用
-<Button variant="primary">Click me</Button>;
-<Button variant="secondary">Cancel</Button>;
-```
-
-### 代码组织
-
-**1. 文件结构**
-
-```
-src/
-├── components/           # 可复用组件
-│   ├── common/         # 通用组件
-│   │   ├── Button/
-│   │   ├── Input/
-│   │   └── Modal/
-│   └── features/       # 功能组件
-│       ├── UserList/
-│       └── PostCard/
-├── hooks/              # 自定义 Hooks
-│   ├── useAuth.js
-│   ├── useFetch.js
-│   └── useForm.js
-├── services/           # API 服务
-│   ├── api.js
-│   └── auth.js
-├── utils/              # 工具函数
-│   ├── helpers.js
-│   └── constants.js
-├── styles/             # 样式文件
-│   ├── globals.css
-│   └── variables.css
-├── types/              # TypeScript 类型
-│   └── index.d.ts
-├── App.js
-└── index.js
-```
-
-**2. 组件导出**
-
-```javascript
-// components/Button/index.js
-// 导出组件、类型、默认样式
-export { default } from './Button';
-export type { ButtonProps } from './Button';
-export { default as buttonStyles } from './Button.module.css';
-
-// 使用
-import Button, { ButtonProps, buttonStyles } from '@/components/Button';
-```
-
-### 命名规范
-
-```javascript
-// 1. 组件：PascalCase
-function UserProfile() {}
-const Header = () => {};
-
-// 2. 函数和变量：camelCase
-function getUserData() {}
-const userName = 'John';
-
-// 3. 常量：UPPER_SNAKE_CASE
-const API_BASE_URL = 'https://api.example.com';
-const MAX_RETRY_COUNT = 3;
-
-// 4. 布尔值：is/has/should 前缀
-const isLoading = true;
-const hasPermission = false;
-const shouldShowModal = true;
-
-// 5. 事件处理：handle 前缀
-const handleSubmit = () => {};
-const handleInputChange = () => {};
-```
-
-### Props 设计
-
-**1. 明确的 Props 类型**
-
-```javascript
-// ✅ 使用 TypeScript 或 PropTypes
-interface ButtonProps {
-  variant?: 'primary' | 'secondary' | 'danger';
-  size?: 'small' | 'medium' | 'large';
-  disabled?: boolean;
-  loading?: boolean;
-  onClick?: () => void;
-  children: React.ReactNode;
-}
-
-function Button({ variant = 'primary', size = 'medium', children, ...props }: ButtonProps) {
-  return (
-    <button className={`btn btn-${variant} btn-${size}`} {...props}>
-      {children}
-    </button>
-  );
-}
-```
-
-**2. 合理的默认值**
-
-```javascript
-// ✅ 提供合理的默认值
-function Card({ title, description, footer, shadow = 'md', rounded = 'lg' }) {
-  return (
-    <div className={`card shadow-${shadow} rounded-${rounded}`}>
-      {title && <h3>{title}</h3>}
-      {description && <p>{description}</p>}
-      {footer && <div className="card-footer">{footer}</div>}
-    </div>
-  );
-}
-```
-
-**3. 避免过度抽象**
-
-```javascript
-// ❌ 过度抽象的组件
-function SuperComponent({ data, config, options, handlers }) {
-  // 太多参数，难以理解和使用
-}
-
-// ✅ 简单直接的组件
-function DataTable({ columns, data, onRowClick }) {
-  // 清晰的职责
-}
-```
-
-### 状态管理
-
-**1. 本地状态优先**
-
-```javascript
-// ✅ 简单状态使用 useState
-function Counter() {
-  const [count, setCount] = useState(0);
-  return <button onClick={() => setCount(c => c + 1)}>{count}</button>;
-}
-```
-
-**2. 复杂状态使用 useReducer**
-
-```javascript
-function counterReducer(state, action) {
-  switch (action.type) {
-    case 'increment':
-      return { count: state.count + 1 };
-    case 'decrement':
-      return { count: state.count - 1 };
-    case 'reset':
-      return { count: 0 };
-    default:
-      return state;
-  }
-}
-
-function Counter() {
-  const [state, dispatch] = useReducer(counterReducer, { count: 0 });
-  
-  return (
-    <div>
-      <span>{state.count}</span>
-      <button onClick={() => dispatch({ type: 'increment' })}>+</button>
-      <button onClick={() => dispatch({ type: 'decrement' })}>-</button>
-      <button onClick={() => dispatch({ type: 'reset' })}>Reset</button>
-    </div>
-  );
-}
-```
-
-**3. 跨组件状态使用 Context**
-
-```javascript
-// 用户认证上下文
-const AuthContext = createContext();
-
-function AuthProvider({ children }) {
-  const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(false);
-  
-  const login = async (credentials) => {
-    setLoading(true);
-    try {
-      const user = await api.login(credentials);
-      setUser(user);
-    } finally {
-      setLoading(false);
-    }
-  };
-  
-  const logout = () => {
-    setUser(null);
-    api.logout();
-  };
-  
-  return (
-    <AuthContext.Provider value={{ user, loading, login, logout }}>
-      {children}
-    </AuthContext.Provider>
-  );
-}
-```
-
-### 错误处理
-
-**1. 错误边界**
-
-```javascript
-// 顶层错误边界
-<ErrorBoundary fallback={<ErrorPage />}>
-  <App />
-</ErrorBoundary>
-
-// 模块级错误边界
-<ErrorBoundary fallback={<DashboardError />}>
-  <Dashboard />
-</ErrorBoundary>
-```
-
-**2. 异步错误处理**
-
-```javascript
-function useAsync(asyncFunction) {
-  const [status, setStatus] = useState('idle');
-  const [data, setData] = useState(null);
-  const [error, setError] = useState(null);
-  
-  const execute = async (...args) => {
-    setStatus('pending');
-    setData(null);
-    setError(null);
+function withPerformanceLogging(handler) {
+  return async (req, res, next) => {
+    const start = performance.now();
+    
+    // 标记开始
+    performance.mark('ssr-start');
     
     try {
-      const result = await asyncFunction(...args);
-      setData(result);
-      setStatus('success');
+      const result = await handler(req, res, next);
+      
+      // 标记结束
+      performance.mark('ssr-end');
+      performance.measure('ssr-duration', 'ssr-start', 'ssr-end');
+      
+      const measure = performance.getEntriesByName('ssr-duration')[0];
+      const duration = measure.duration;
+      
+      // 记录到监控系统
+      console.log(`SSR ${req.url} took ${duration}ms`);
+      
+      // 上报到监控系统（如 Sentry, Datadog）
+      trackPerformance('ssr', {
+        url: req.url,
+        duration,
+        timestamp: Date.now()
+      });
+      
       return result;
-    } catch (err) {
-      setError(err);
-      setStatus('error');
-      throw err;
+    } catch (error) {
+      console.error('SSR error:', error);
+      throw error;
     }
   };
-  
-  return { execute, status, data, error };
 }
 
 // 使用
-function UserProfile({ userId }) {
-  const { execute, status, data, error } = useAsync(
-    () => api.getUser(userId)
-  );
+app.get('*', withPerformanceLogging(renderWithCache));
+```
+
+### 同构渲染解决的性能指标
+
+#### 1. SEO 相关指标
+
+```javascript
+// 1. 搜索引擎爬虫可以直接读取内容
+// 传统 SPA：爬虫只能看到空的 <div id="root"></div>
+// SSR：爬虫可以看到完整的 HTML 内容
+
+// 2. Meta 标签和 Open Graph
+export async function getServerSideProps(context) {
+  const product = await getProduct(context.params.id);
   
-  useEffect(() => {
-    execute();
-  }, [userId]);
-  
-  if (status === 'pending') return <Spinner />;
-  if (status === 'error') return <Error message={error.message} />;
-  return <div>{data?.name}</div>;
+  return {
+    props: { product },
+    // 动态设置 Meta 标签
+    meta: {
+      title: product.name,
+      description: product.description,
+      openGraph: {
+        title: product.name,
+        images: [product.image],
+        url: `https://example.com/product/${product.id}`,
+      },
+    },
+  };
 }
 ```
 
-### 性能优化
+**解决的指标：**
+- SEO 排名提升
+- 社交媒体分享预览优化
+- 搜索引擎收录速度
 
-**1. 避免不必要的渲染**
+#### 2. 首屏渲染指标
 
 ```javascript
-// ✅ 使用 React.memo
-const ExpensiveComponent = React.memo(({ data }) => {
-  return <div>{/* 渲染逻辑 */}</div>;
+// 性能对比
+// CSR (Client-Side Rendering):
+// - TTFB: 100ms
+// - First Paint: 100ms (空白 HTML)
+// - FCP: 1500ms (等待 JS 加载和执行)
+// - LCP: 2500ms
+// - TTI: 3000ms
+
+// SSR (Server-Side Rendering):
+// - TTFB: 300ms (服务器渲染时间)
+// - First Paint: 350ms (已有 HTML 内容)
+// - FCP: 400ms (立即显示内容)
+// - LCP: 800ms
+// - TTI: 1200ms
+```
+
+**解决的指标：**
+
+| 指标 | CSR | SSR | 提升 |
+|------|-----|-----|------|
+| TTFB | 100ms | 300ms | ↓ 200ms |
+| FCP | 1500ms | 400ms | ↓ 73% |
+| LCP | 2500ms | 800ms | ↓ 68% |
+| TTI | 3000ms | 1200ms | ↓ 60% |
+| CLS | 0.25 | 0.05 | ↓ 80% |
+
+#### 3. 用户体验指标
+
+```javascript
+// 1. 减少 CLS (Cumulative Layout Shift)
+// SSR 内容预先渲染，减少布局偏移
+
+// 2. 减少 LCP (Largest Contentful Paint)
+// 关键内容立即显示，不需要等待 JS
+
+// 3. 减少 FID (First Input Delay)
+// 部分交互立即可用（使用选择性 Hydration）
+
+// 4. 提升 TBT (Total Blocking Time)
+// 减少主线程阻塞时间
+```
+
+#### 4. 网络性能指标
+
+```javascript
+// 1. 减少初始 HTML 加载时间
+// 返回的是完整 HTML，而不是空白页面
+
+// 2. 减少关键资源加载
+// 内联关键 CSS
+<style dangerouslySetInnerHTML={{ __html: criticalCss }} />
+
+// 3. 优化资源加载顺序
+<link rel="preload" href="/critical.css" as="style" />
+<link rel="prefetch" href="/next-page.js" as="script" />
+```
+
+### 我的落地实践
+
+```javascript
+// 完整的 SSR 优化方案
+import express from 'express';
+import { renderToPipeableStream } from 'react-dom/server';
+import { Helmet } from 'react-helmet';
+import Redis from 'ioredis';
+
+const app = express();
+const redis = new Redis();
+
+// 1. 健康检查
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: Date.now() });
 });
 
-// ✅ 使用 useMemo
-const expensiveValue = useMemo(() => {
-  return heavyCalculation(data);
-}, [data]);
+// 2. 静态资源
+app.use(express.static('public', {
+  maxAge: '1y',
+  etag: true,
+}));
 
-// ✅ 使用 useCallback
-const handleClick = useCallback(() => {
-  doSomething();
-}, []);
-```
-
-**2. 代码分割**
-
-```javascript
-// ✅ 路由懒加载
-const Home = lazy(() => import('./pages/Home'));
-const Dashboard = lazy(() => import('./pages/Dashboard'));
-
-// ✅ 组件懒加载
-const HeavyComponent = lazy(() => import('./HeavyComponent'));
-```
-
-### 可访问性
-
-**1. 语义化 HTML**
-
-```javascript
-// ✅ 使用语义化标签
-<nav>
-  <ul>
-    <li><a href="/">Home</a></li>
-    <li><a href="/about">About</a></li>
-  </ul>
-</nav>
-
-<main>
-  <article>
-    <h1>Article Title</h1>
-    <p>Article content...</p>
-  </article>
-</main>
-
-<footer>
-  <p>&copy; 2024 My App</p>
-</footer>
-```
-
-**2. ARIA 属性**
-
-```javascript
-// ✅ 添加 ARIA 属性
-<button 
-  aria-label="Close modal"
-  aria-pressed={isPressed}
-  onClick={handleClick}
->
-  ×
-</button>
-
-<div role="alert" aria-live="polite">
-  {errorMessage}
-</div>
-```
-
-**3. 键盘导航**
-
-```javascript
-// ✅ 支持键盘导航
-function Modal({ isOpen, onClose }) {
-  useEffect(() => {
-    if (!isOpen) return;
+// 3. 性能监控中间件
+app.use((req, res, next) => {
+  req.startTime = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - req.startTime;
+    console.log(`${req.method} ${req.url} - ${duration}ms`);
     
-    const handleEscape = (e) => {
-      if (e.key === 'Escape') onClose();
-    };
-    
-    document.addEventListener('keydown', handleEscape);
-    return () => document.removeEventListener('keydown', handleEscape);
-  }, [isOpen, onClose]);
-  
-  return (
-    isOpen && (
-      <div role="dialog" aria-modal="true">
-        <button 
-          onClick={onClose}
-          aria-label="Close"
-        >
-          Close
-        </button>
-      </div>
-    )
-  );
-}
-```
-
-### 测试
-
-**1. 单元测试**
-
-```javascript
-// ✅ 测试组件行为
-describe('Button', () => {
-  it('calls onClick handler when clicked', () => {
-    const handleClick = jest.fn();
-    render(<Button onClick={handleClick}>Click me</Button>);
-    
-    fireEvent.click(screen.getByRole('button'));
-    expect(handleClick).toHaveBeenCalledTimes(1);
-  });
-});
-```
-
-**2. 集成测试**
-
-```javascript
-// ✅ 测试用户流程
-describe('User Flow', () => {
-  it('allows user to login and view dashboard', async () => {
-    render(<App />);
-    
-    // 登录
-    fireEvent.change(screen.getByLabelText(/email/i), { target: { value: 'user@example.com' }});
-    fireEvent.change(screen.getByLabelText(/password/i), { target: { value: 'password' }});
-    fireEvent.click(screen.getByRole('button', { name: /login/i }));
-    
-    // 等待跳转到 dashboard
-    await waitFor(() => {
-      expect(screen.getByText(/dashboard/i)).toBeInTheDocument();
+    // 上报到监控系统
+    trackRequest({
+      method: req.method,
+      url: req.url,
+      duration,
+      status: res.statusCode
     });
   });
+  next();
+});
+
+// 4. SSR 渲染路由
+app.get('*', async (req, res) => {
+  const start = Date.now();
+  
+  try {
+    // 缓存检查
+    const cacheKey = `ssr:${req.url}:${req.headers['user-agent']}`;
+    const cached = await redis.get(cacheKey);
+    
+    if (cached) {
+      res.setHeader('X-Cache', 'HIT');
+      return res.send(cached);
+    }
+    
+    // 渲染应用
+    const helmetContext = {};
+    const { pipe } = renderToPipeableStream(
+      <App url={req.url} />,
+      {
+        bootstrapModules: ['/client.js'],
+        onShellReady() {
+          const helmet = Helmet.renderStatic();
+          
+          // 构建完整 HTML
+          const html = `
+            <!DOCTYPE html>
+            <html lang="en">
+              <head>
+                <meta charset="UTF-8" />
+                <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+                ${helmet.title.toString()}
+                ${helmet.meta.toString()}
+                ${helmet.link.toString()}
+                <link rel="stylesheet" href="/styles.css" />
+              </head>
+              <body>
+                <div id="root"></div>
+                <script src="/client.js" defer></script>
+              </body>
+            </html>
+          `;
+          
+          // 写入 HTML 头部
+          res.write(html.replace('<div id="root"></div>', ''));
+          res.write('<div id="root">');
+          
+          // 流式发送内容
+          pipe(res);
+        },
+        
+        onShellError(error) {
+          console.error('Shell error:', error);
+          res.status(500).send('Error loading application');
+        },
+        
+        onAllReady() {
+          const duration = Date.now() - start;
+          console.log(`SSR completed in ${duration}ms`);
+        }
+      }
+    );
+    
+  } catch (error) {
+    console.error('SSR error:', error);
+    res.status(500).send('Internal Server Error');
+  }
+});
+
+app.listen(3000, () => {
+  console.log('SSR server running on port 3000');
 });
 ```
 
-### 文档
+### 总结
 
-**1. 组件文档**
+**同构渲染解决的核心性能指标：**
+
+1. **FCP (First Contentful Paint)** - 首次内容绘制时间
+2. **LCP (Largest Contentful Paint)** - 最大内容绘制时间
+3. **TTI (Time to Interactive)** - 可交互时间
+4. **CLS (Cumulative Layout Shift)** - 累积布局偏移
+5. **SEO 排名和收录**
+6. **社交媒体分享优化**
+7. **首屏加载速度**
+8. **用户体验感知**
+
+**关键优化策略：**
+1. 缓存策略（Redis CDN）
+2. 代码分割和懒加载
+3. 数据预取和缓存
+4. 流式渲染和 Suspense
+5. 静态资源优化
+6. 性能监控和告警
+7. ISR 和按需渲染
+
+---
+
+## 26、React 进行ServerLess渲染时候项目需要做哪些改变？
+
+### Serverless 渲染的架构调整
+
+#### 1. 项目结构改造
 
 ```javascript
-/**
- * Button Component
- * 
- * @description A reusable button component with multiple variants and sizes.
- * 
- * @example
- * ```jsx
- * <Button variant="primary" onClick={handleClick}>
- *   Click me
- * </Button>
- * ```
- */
-function Button({ children, ...props }) {
-  return <button {...props}>{children}</button>;
+// 传统项目结构
+// next.config.js
+module.exports = {
+  target: 'server',
+  // 配置
+};
+
+// Serverless 项目结构
+// next.config.js
+module.exports = {
+  target: 'serverless',
+  // 或者在每个页面单独配置
+  // export const config = { runtime: 'nodejs' };
+};
+```
+
+#### 2. 环境变量管理
+
+```javascript
+// 服务器端环境变量
+// .env.production
+DATABASE_URL=postgresql://...
+REDIS_URL=redis://...
+API_KEY=xxxxxx
+
+// 构建时环境变量
+// .env.production.build
+NEXT_PUBLIC_API_URL=https://api.example.com
+NEXT_PUBLIC_GA_ID=G-XXXXXX
+
+// 运行时环境变量（Serverless）
+// 使用环境变量注入
+module.exports = {
+  env: {
+    // 构建时确定
+    BUILD_TIME: new Date().toISOString(),
+    // 运行时确定（Serverless 函数）
+    RUNTIME_ENV: process.env.NODE_ENV,
+  },
+};
+```
+
+#### 3. 数据库连接优化
+
+```javascript
+// 问题：Serverless 环境中数据库连接不能长时间保持
+// 解决方案：使用连接池或每次请求新建连接
+
+// 方案1：使用连接池（推荐）
+import { Pool } from 'pg';
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 20, // 最大连接数
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
+
+// 在 Serverless 函数中使用
+export async function getServerSideProps() {
+  const client = await pool.connect();
+  
+  try {
+    const result = await client.query('SELECT * FROM users');
+    return { props: { users: result.rows } };
+  } finally {
+    client.release(); // 释放连接回池
+  }
+}
+
+// 方案2：每次请求新建连接（简单场景）
+import { Pool } from 'pg';
+
+export async function handler(event) {
+  const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  
+  try {
+    const result = await pool.query('SELECT * FROM users');
+    return { users: result.rows };
+  } finally {
+    await pool.end(); // 关闭连接
+  }
+}
+
+// 方案3：使用 Serverless 专用的数据库客户端
+import { PrismaClient } from '@prisma/client';
+
+const globalForPrisma = global;
+
+const prisma = globalForPrisma.prisma || new PrismaClient({
+  log: ['query', 'error', 'warn'],
+});
+
+if (process.env.NODE_ENV !== 'production') {
+  globalForPrisma.prisma = prisma;
+}
+
+export default prisma;
+```
+
+#### 4. 文件系统处理
+
+```javascript
+// 问题：Serverless 环境中文件系统是临时的
+// 解决方案：使用对象存储（S3）
+
+// 错误做法（文件会丢失）
+export async function uploadFile(file) {
+  const path = `/uploads/${file.name}`;
+  fs.writeFileSync(path, file.buffer);
+  return path; // 下次请求时文件已不存在
+}
+
+// 正确做法：使用 S3
+import AWS from 'aws-sdk';
+import { v4 as uuidv4 } from 'uuid';
+
+const s3 = new AWS.S3({
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  region: process.env.AWS_REGION,
+});
+
+export async function uploadFile(file) {
+  const key = `uploads/${uuidv4()}-${file.name}`;
+  
+  await s3.upload({
+    Bucket: process.env.S3_BUCKET,
+    Key: key,
+    Body: file.buffer,
+    ContentType: file.mimetype,
+  }).promise();
+  
+  return `https://${process.env.S3_BUCKET}.s3.amazonaws.com/${key}`;
 }
 ```
 
-**2. JSDoc 注释**
+#### 5. 会话管理
 
 ```javascript
-/**
- * Fetches user data from the API
- * 
- * @param {number} userId - The ID of the user to fetch
- * @returns {Promise<User>} A promise that resolves to the user object
- * 
- * @example
- * const user = await fetchUser(123);
- * console.log(user.name);
- */
-async function fetchUser(userId) {
-  const response = await fetch(`/api/users/${userId}`);
-  return response.json();
+// 问题：Serverless 函数无状态，内存不持久
+// 解决方案：使用外部存储（Redis、DynamoDB）
+
+// 错误做法（内存会丢失）
+const sessions = {};
+
+export async function handler(event) {
+  const sessionId = event.cookies.sessionId;
+  sessions[sessionId] = userData; // 下次请求时已丢失
+}
+
+// 正确做法：使用 Redis
+import Redis from 'ioredis';
+
+const redis = new Redis(process.env.REDIS_URL);
+
+export async function handler(event) {
+  const sessionId = event.cookies.sessionId;
+  
+  // 存储会话
+  await redis.setex(`session:${sessionId}`, 3600, JSON.stringify(userData));
+  
+  // 获取会话
+  const session = await redis.get(`session:${sessionId}`);
+  return JSON.parse(session);
 }
 ```
 
-### 安全性
-
-**1. 防止 XSS**
+#### 6. 请求超时处理
 
 ```javascript
-// ✅ 防止 XSS
-function Message({ content }) {
-  // React 自动转义，避免使用 dangerouslySetInnerHTML
-  return <div>{content}</div>;
+// 问题：Serverless 函数有执行时间限制（如 Lambda 15分钟）
+// 解决方案：超时重试、分片处理
+
+// 1. 超时重试
+async function withRetry(fn, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (i === maxRetries - 1) throw error;
+      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+    }
+  }
 }
 
-// 如果必须使用，确保内容是可信的
-function SafeHTML({ html }) {
-  // 使用 DOMPurify 或其他库清理 HTML
-  const cleanHTML = DOMPurify.sanitize(html);
-  return <div dangerouslySetInnerHTML={{ __html: cleanHTML }} />;
+// 2. 分片处理
+async function processLargeData(data) {
+  const chunkSize = 100;
+  const chunks = [];
+  
+  for (let i = 0; i < data.length; i += chunkSize) {
+    const chunk = data.slice(i, i + chunkSize);
+    chunks.push(processChunk(chunk));
+  }
+  
+  return Promise.all(chunks);
+}
+
+// 3. 使用 SQS 队列异步处理
+import { SQS } from 'aws-sdk';
+
+const sqs = new SQS();
+
+async function queueTask(task) {
+  await sqs.sendMessage({
+    QueueUrl: process.env.SQS_QUEUE_URL,
+    MessageBody: JSON.stringify(task),
+  }).promise();
 }
 ```
 
-**2. 敏感数据保护**
+#### 7. 日志和监控
 
 ```javascript
-// ✅ 不在客户端存储敏感信息
-// 不要在 localStorage 中存储密码、token 等
+// 问题：Serverless 环境中没有标准日志
+// 解决方案：结构化日志、云监控
 
-// ✅ 使用 HttpOnly cookies
-// 在服务端设置 HttpOnly 和 Secure cookies
+// 结构化日志
+export async function handler(event) {
+  const startTime = Date.now();
+  
+  try {
+    const result = await processRequest(event);
+    
+    const log = {
+      timestamp: new Date().toISOString(),
+      requestId: event.requestContext?.requestId,
+      duration: Date.now() - startTime,
+      status: 'success',
+      result: result,
+    };
+    
+    console.log(JSON.stringify(log));
+    return result;
+    
+  } catch (error) {
+    const log = {
+      timestamp: new Date().toISOString(),
+      requestId: event.requestContext?.requestId,
+      duration: Date.now() - startTime,
+      status: 'error',
+      error: error.message,
+      stack: error.stack,
+    };
+    
+    console.error(JSON.stringify(log));
+    throw error;
+  }
+}
 
-// ✅ 验证和清理用户输入
-function sanitizeInput(input) {
-  return input.trim().replace(/[<>]/g, '');
+// 集成 CloudWatch 或 Datadog
+import { Datadog } from 'datadog-lambda-js';
+
+const tracer = require('dd-trace').init({
+  logInjection: true,
+  analytics: true,
+});
+
+export const handler = wrap(handler, { tracer });
+```
+
+#### 8. 配置文件调整
+
+```javascript
+// next.config.js - Serverless 优化
+module.exports = {
+  target: 'serverless',
+  
+  // 减少包大小
+  webpack: (config, { isServer }) => {
+    if (!isServer) {
+      config.externals = ['aws-sdk']; // 不打包 aws-sdk
+    }
+    return config;
+  },
+  
+  // 环境变量
+  env: {
+    BUILD_TIME: new Date().toISOString(),
+  },
+  
+  // 图片优化配置
+  images: {
+    domains: ['s3.amazonaws.com'],
+    deviceSizes: [640, 750, 828, 1080, 1200, 1920],
+    imageSizes: [16, 32, 48, 64, 96, 128, 256, 384],
+  },
+};
+
+// package.json - 依赖优化
+{
+  "dependencies": {
+    "next": "^13.0.0",
+    "react": "^18.0.0",
+    "aws-lambda": "^1.0.0",
+    "aws-sdk": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
+```
+
+#### 9. 部署配置
+
+```javascript
+// 使用 Serverless Framework
+// serverless.yml
+service: nextjs-app
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  
+functions:
+  api:
+    handler: .next/serverless/pages/index.js
+    events:
+      - httpApi:
+          path: /{proxy+}
+          method: any
+    timeout: 28  # 接近 Lambda 限制
+    memorySize: 1024
+    
+    environment:
+      DATABASE_URL: ${env:DATABASE_URL}
+      REDIS_URL: ${env:REDIS_URL}
+      
+  imageOptimizer:
+    handler: .next/serverless/image-handler.js
+    timeout: 30
+    memorySize: 2048
+
+plugins:
+  - serverless-nextjs-plugin
+
+custom:
+  serverless-nextjs:
+    nextConfigDir: ./
+    
+// 使用 AWS SAM
+// template.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  NextJSFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: nextjs-app
+      Handler: .next/serverless/pages/index.handler
+      Runtime: nodejs18.x
+      Timeout: 28
+      MemorySize: 1024
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref DatabaseUrl
+          REDIS_URL: !Ref RedisUrl
+      Events:
+        HttpApi:
+          Type: HttpApi
+          Properties:
+            Path: /{proxy+}
+            Method: any
+```
+
+#### 10. 优化建议
+
+```javascript
+// 1. 减少冷启动时间
+// - 使用 AWS Lambda Provisioned Concurrency
+// - 保持函数温暖（定时 ping）
+const keepWarm = async () => {
+  await fetch('https://your-api.com/health');
+};
+
+// 每 5 分钟调用一次保持温暖
+setInterval(keepWarm, 5 * 60 * 1000);
+
+// 2. 优化内存使用
+// - 合理设置内存大小
+// - 清理不必要的变量
+export async function handler(event) {
+  let result;
+  
+  try {
+    result = await processRequest(event);
+  } finally {
+    // 清理大对象
+    event = null;
+  }
+  
+  return result;
+}
+
+// 3. 使用 Edge Functions（Vercel）
+// next.config.js
+module.exports = {
+  experimental: {
+    // 使用边缘函数
+    serverComponentsExternalPackages: ['sharp'],
+  },
+};
+
+// pages/api/edge.js
+export const config = {
+  runtime: 'edge',
+};
+
+export default function handler(req) {
+  return new Response('Hello from Edge!');
 }
 ```
 
 ### 总结
 
-**最佳实践清单：**
+**Serverless 渲染需要的主要改变：**
 
-```javascript
-// 组件设计
-✓ 单一职责
-✓ 关注点分离
-✓ 组合优于继承
-✓ 合理的 Props 设计
+1. **架构调整**
+   - 使用 `target: 'serverless'` 配置
+   - 无状态设计
+   - 函数独立部署
 
-// 代码组织
-✓ 清晰的文件结构
-✓ 统一的命名规范
-✓ 模块化导出
+2. **资源管理**
+   - 数据库连接池
+   - 文件存储改用 S3
+   - 会话存储改用 Redis
 
-// 状态管理
-✓ 本地状态优先
-✓ 复杂状态使用 useReducer
-✓ 跨组件状态使用 Context
+3. **性能优化**
+   - 减少冷启动
+   - 优化包大小
+   - 合理设置超时
 
-// 错误处理
-✓ 使用 Error Boundary
-✓ 处理异步错误
-✓ 友好的错误提示
+4. **监控调试**
+   - 结构化日志
+   - 分布式追踪
+   - 错误监控
 
-// 性能优化
-✓ 避免不必要的渲染
-✓ 代码分割和懒加载
-✓ 使用 React DevTools Profiler
-
-// 可访问性
-✓ 语义化 HTML
-✓ ARIA 属性
-✓ 键盘导航支持
-
-// 测试
-✓ 单元测试
-✓ 集成测试
-✓ 测试覆盖率
-
-// 文档
-✓ 组件文档
-✓ JSDoc 注释
-✓ 使用示例
-
-// 安全性
-✓ 防止 XSS
-✓ 敏感数据保护
-✓ 输入验证和清理
-```
-
-**高质量代码特征：**
-
-- **可读性** - 代码清晰易懂
-- **可维护性** - 容易修改和扩展
-- **可测试性** - 容易编写测试
-- **可重用性** - 组件和函数可复用
-- **性能** - 高效的渲染和更新
-- **可访问性** - 对所有用户友好
-- **安全性** - 防止常见安全漏洞
+5. **部署策略**
+   - 使用 Serverless Framework
+   - 或云厂商原生工具（AWS SAM）
+   - 或平台即服务（Vercel Netlify）
 
 ---
 
-**React 30问 - 详细解答 完成！**
+## 27、刚才你也提到了可以部署的平台有很多，那么每个平台进行JS冷启动的区别是什么呢？
+
+### JS 冷启动在不同平台的区别
+
+#### 1. Vercel
+
+**冷启动特点：**
+- 使用 Serverless Functions (AWS Lambda)
+- 默认超时：10秒（Pro plan 可以到 60秒）
+- 默认内存：1024MB（可配置到 3008MB）
+
+```javascript
+// Vercel 冷启动机制
+// pages/api/hello.js
+export default function handler(req, res) {
+  // 首次请求：冷启动 ~500-2000ms
+  // 后续请求：热启动 ~50-200ms
+  res.json({ message: 'Hello' });
+}
+
+// 优化策略
+export const config = {
+  // 1. 使用 Edge Functions 减少冷启动
+  runtime: 'edge',
+  
+  // 2. 预热函数
+  maxDuration: 30,  // 增加超时
+};
+```
+
+**冷启动时间：**
+- 首次请求：500-2000ms
+- 热启动：50-200ms
+- Edge Functions：50-300ms（更快但有限制）
+
+**优化建议：**
+- 使用 Edge Functions 处理简单请求
+- 启用 ISR 减少动态渲染
+- 使用 Vercel KV 缓存数据
+
+#### 2. Netlify
+
+**冷启动特点：**
+- 使用 AWS Lambda
+- 默认超时：10秒
+- 支持 Netlify Functions（Go、Node.js、Rust）
+
+```javascript
+// Netlify Functions
+// functions/api/hello.js
+exports.handler = async (event, context) => {
+  // 冷启动：600-3000ms
+  return {
+    statusCode: 200,
+    body: JSON.stringify({ message: 'Hello' }),
+  };
+};
+
+// 优化：使用 Netlify Edge Functions
+// edge-functions/api/hello.js
+export default (request) => {
+  // 冷启动：100-500ms（更快）
+  return new Response('Hello from Edge!');
+};
+```
+
+**冷启动时间：**
+- Netlify Functions：600-3000ms
+- Netlify Edge Functions：100-500ms
+- 后续请求：50-150ms
+
+**优化建议：**
+- 使用 Edge Functions 处理频繁访问
+- 启用 Netlify Background Functions
+- 使用 Netlify Large Media 处理图片
+
+#### 3. AWS Lambda
+
+**冷启动特点：**
+- 原生 Serverless
+- 高度可配置
+- 支持多种运行时
+
+```javascript
+// AWS Lambda Handler
+exports.handler = async (event) => {
+  // 冷启动：500-3000ms
+  // 配置不同，冷启动时间不同
+  
+  return {
+    statusCode: 200,
+    body: JSON.stringify({ message: 'Hello' }),
+  };
+};
+
+// 优化策略
+// 1. 使用 Provisioned Concurrency
+const lambda = new AWS.Lambda();
+
+// 2. 使用 SnapStart（Java）或类似机制
+// 3. 合理配置内存（内存越大，启动越快）
+const memorySize = 2048; // 2048MB 比 512MB 启动快
+```
+
+**冷启动时间：**
+- 128MB 内存：2000-5000ms
+- 512MB 内存：1000-3000ms
+- 1024MB 内存：500-2000ms
+- 2048MB 内存：300-1500ms
+- Provisioned Concurrency：<10ms
+
+**优化建议：**
+- 增加内存大小（更快）
+- 使用 Provisioned Concurrency（消除冷启动）
+- 使用 SnapStart（Java）或 Layer 复制代码
+
+#### 4. Google Cloud Functions
+
+**冷启动特点：**
+- 使用 Cloud Run（Gen 2）
+- 默认超时：1小时
+- 支持 Gen 1 和 Gen 2
+
+```javascript
+// Cloud Functions Gen 2
+const functions = require('@google-cloud/functions-framework');
+
+functions.http('hello', async (req, res) => {
+  // 冷启动：300-1500ms（比 Lambda 快）
+  res.json({ message: 'Hello' });
+});
+
+// Cloud Run（更灵活）
+// index.js
+const express = require('express');
+const app = express();
+
+app.get('/', (req, res) => {
+  res.json({ message: 'Hello' });
+});
+
+module.exports = app;
+```
+
+**冷启动时间：**
+- Gen 1：500-3000ms
+- Gen 2：300-1500ms（更快）
+- Cloud Run：200-1000ms
+
+**优化建议：**
+- 使用 Gen 2（更快）
+- 设置最小实例数
+- 使用 Cloud Run（更灵活）
+
+#### 5. Cloudflare Workers
+
+**冷启动特点：**
+- V8 Isolate 模型
+- 极快的冷启动
+- 全球边缘网络
+
+```javascript
+// Cloudflare Workers
+export default {
+  async fetch(request) {
+    // 冷启动：10-100ms（极快！）
+    return new Response('Hello from Cloudflare!');
+  },
+};
+
+// Pages Functions
+export async function onRequestGet(context) {
+  // 冷启动：50-200ms
+  return new Response('Hello!');
+}
+```
+
+**冷启动时间：**
+- Cloudflare Workers：10-100ms（最快）
+- Cloudflare Pages Functions：50-200ms
+- 后续请求：1-10ms
+
+**优化建议：**
+- 使用 Workers 处理频繁请求
+- 利用 KV 存储缓存
+- 使用 D1 数据库
+
+#### 6. 阿里云函数计算
+
+**冷启动特点：**
+- 类似 AWS Lambda
+- 支持多种运行时
+
+```javascript
+// 阿里云 FC
+exports.handler = async (event, context) => {
+  // 冷启动：800-4000ms
+  return {
+    statusCode: 200,
+    body: JSON.stringify({ message: 'Hello' }),
+  };
+};
+
+// 使用 Custom Runtime
+// 使用 Docker 镜像启动更快
+```
+
+**冷启动时间：**
+- 128MB：1500-5000ms
+- 512MB：800-3000ms
+- 1024MB：500-2000ms
+- Custom Runtime：300-1500ms
+
+**优化建议：**
+- 增加内存配置
+- 使用 Custom Runtime
+- 使用预留实例
+
+#### 7. 腾讯云 SCF
+
+**冷启动特点：**
+- 类似 AWS Lambda
+- 支持多种运行时
+
+```javascript
+// 腾讯云 SCF
+exports.main_handler = async (event, context) => {
+  // 冷启动：1000-4000ms
+  return {
+    statusCode: 200,
+    body: JSON.stringify({ message: 'Hello' }),
+  };
+};
+```
+
+**冷启动时间：**
+- 128MB：1500-5000ms
+- 512MB：1000-3000ms
+- 1024MB：500-2000ms
+
+**优化建议：**
+- 增加内存配置
+- 使用预置并发
+- 使用层（Layer）优化
+
+### 平台对比
+
+| 平台 | 冷启动时间 | 热启动 | 优势 | 劣势 |
+|------|-----------|---------|------|------|
+| Vercel | 500-2000ms | 50-200ms | 易用、集成好 | 限制较多、贵 |
+| Netlify | 600-3000ms | 50-150ms | 功能丰富、免费额度大 | 冷启动较慢 |
+| AWS Lambda | 500-3000ms | 10-100ms | 灵活、功能强大 | 配置复杂 |
+| Google Cloud | 300-1500ms | 10-50ms | 速度快、集成好 | 文档较少 |
+| Cloudflare | 10-100ms | 1-10ms | 极快、免费 | 限制多 |
+| 阿里云 | 800-4000ms | 50-200ms | 国内访问快 | 冷启动慢 |
+| 腾讯云 | 1000-4000ms | 50-200ms | 国内访问快 | 冷启动慢 |
+
+### 冷启动优化策略
+
+#### 1. 通用优化
+
+```javascript
+// 1. 减少依赖和包大小
+// package.json
+{
+  "dependencies": {
+    // 只使用必要的依赖
+    "lodash-es": "^4.17.0",  // 使用 ES 模块版本
+  },
+  "scripts": {
+    "build": "webpack --mode production"
+  }
+}
+
+// 2. 初始化优化
+// 在全局作用域初始化（只在冷启动时执行）
+let dbConnection;
+
+export async function handler(event) {
+  if (!dbConnection) {
+    dbConnection = await connectToDatabase();
+  }
+  
+  return processRequest(event);
+}
+
+// 3. 使用轻量级运行时
+// 使用 Bun 或 Deno 替代 Node.js
+export default {
+  async fetch(request) {
+    return new Response('Hello from Bun!');
+  },
+};
+```
+
+#### 2. 平台特定优化
+
+```javascript
+// Vercel 优化
+// 1. 使用 Edge Functions
+export const config = {
+  runtime: 'edge',
+};
+
+// 2. 启用 ISR
+export async function getStaticProps() {
+  return {
+    props: { data },
+    revalidate: 60,
+  };
+}
+
+// AWS Lambda 优化
+// 1. 使用 Provisioned Concurrency
+const lambda = new AWS.Lambda();
+
+await lambda.updateFunctionConcurrency({
+  FunctionName: 'my-function',
+  ProvisionedConcurrentExecutions: 5,
+}).promise();
+
+// 2. 使用 SnapStart（Java）
+// 或使用 Lambda Layers 预加载依赖
+
+// Cloudflare 优化
+// 1. 使用 KV 缓存
+const cache = await MY_KV.get('key');
+if (cache) {
+  return new Response(cache);
+}
+
+// 2. 使用 D1 数据库（Edge SQL）
+const result = await env.DB.prepare('SELECT * FROM users').all();
+```
+
+#### 3. 预热策略
+
+```javascript
+// 1. 定时 ping 保持温暖
+const keepWarm = async () => {
+  await fetch('https://your-api.com/health');
+};
+
+// 每 5 分钟调用一次
+setInterval(keepWarm, 5 * 60 * 1000);
+
+// 2. 使用 CloudWatch Events 触发
+// AWS Lambda
+{
+  "Events": [{
+    "Type": "Schedule",
+    "Properties": {
+      "ScheduleExpression": "rate(5 minutes)"
+    }
+  }]
+}
+
+// 3. 使用外部服务监控
+// UptimeRobot、Pingdom 等定时访问
+```
+
+### 实际测试数据
+
+```javascript
+// 测试脚本：测量不同平台的冷启动时间
+const platforms = [
+  'https://vercel-app.com/api/hello',
+  'https://netlify-app.com/api/hello',
+  'https://aws-lambda-app.com/hello',
+  'https://gcp-app.com/hello',
+  'https://cloudflare-app.com/hello',
+];
+
+async function testColdStart(url) {
+  const times = [];
+  
+  for (let i = 0; i < 10; i++) {
+    const start = Date.now();
+    await fetch(url);
+    const duration = Date.now() - start;
+    times.push(duration);
+    
+    // 等待 30 秒让函数冷却
+    await new Promise(resolve => setTimeout(resolve, 30000));
+  }
+  
+  return {
+    avg: times.reduce((a, b) => a + b) / times.length,
+    min: Math.min(...times),
+    max: Math.max(...times),
+  };
+}
+
+// 测试结果示例（仅供参考）
+const results = {
+  Vercel: { avg: 1200, min: 500, max: 2000 },
+  Netlify: { avg: 1500, min: 600, max: 3000 },
+  AWS: { avg: 1800, min: 500, max: 3000 },
+  GCP: { avg: 1000, min: 300, max: 1500 },
+  Cloudflare: { avg: 50, min: 10, max: 100 },
+};
+```
+
+### 选择建议
+
+**选择标准：**
+
+1. **需要极快响应**
+   - 选择：Cloudflare Workers
+   - 场景：API 网关、缓存层、轻量计算
+
+2. **国内访问优化**
+   - 选择：阿里云 FC、腾讯云 SCF
+   - 场景：面向国内用户
+
+3. **易用性和集成**
+   - 选择：Vercel、Netlify
+   - 场景：前端团队、快速开发
+
+4. **灵活性和控制力**
+   - 选择：AWS Lambda、Google Cloud Functions
+   - 场景：复杂后端、企业应用
+
+5. **成本敏感**
+   - 选择：Cloudflare（免费额度大）、Netlify
+   - 场景：个人项目、小流量应用
+
+### 总结
+
+**冷启动对比：**
+
+1. **最快**：Cloudflare Workers（10-100ms）
+2. **较快**：Google Cloud（300-1500ms）、Vercel（500-2000ms）
+3. **中等**：AWS Lambda（500-3000ms）、Netlify（600-3000ms）
+4. **较慢**：阿里云（800-4000ms）、腾讯云（1000-4000ms）
+
+**关键因素：**
+- 平台架构（V8 Isolate vs 容器）
+- 内存配置（内存越大越快）
+- 代码大小（越小越快）
+- 依赖数量（越少越快）
+- 地理位置距离（越近越快）
+
+**优化方向：**
+- 减少代码和依赖
+- 增加内存配置
+- 使用预置并发
+- 使用边缘计算
+- 实施预热策略
+- 利用缓存机制
