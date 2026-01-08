@@ -1,3 +1,5 @@
+![React](./img/answers-react.png)
+
 # React 30问 - 详细解答
 
 ## 1、高阶组件(HOC)是什么？你在业务中使用过解决了什么问题。
