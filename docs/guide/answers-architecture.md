@@ -1,4 +1,4 @@
-
+![React](./img/jiagou.png)
 
 # 前端架构方向
 
